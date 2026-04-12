@@ -16,6 +16,46 @@ from typing import Any, Dict, Optional, Sequence
 DEFAULT_JOERN_CLI_DIR = Path("/people/cs/x/xxr230000/bin/joern/joern-cli")
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "joern_slice"
 IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+CALLS_CACHE_DIR = DEFAULT_CACHE_DIR / "calls"
+
+CALL_ROWS_SCRIPT = r"""
+import io.circe.syntax._
+import io.circe.generic.auto._
+
+case class CallRow(
+  name: String,
+  code: String,
+  line: Int,
+  methodFullName: String,
+  dispatchType: String,
+  callerMethodName: String,
+  targetMethodName: String,
+  isExternalTarget: Boolean
+)
+
+@main def exec(cpgFile:String, outFile:String) = {
+  importCpg(cpgFile)
+  val rows = cpg.call.l.map { call =>
+    val mfn = call.methodFullName
+    val methods = cpg.method.fullNameExact(mfn).l
+    val targetName = methods.headOption.map(_.name).getOrElse("")
+    val ext = methods.exists(_.isExternal)
+    val line = call.lineNumber.map(_.intValue).getOrElse(-1)
+    CallRow(
+      call.name,
+      call.code,
+      line,
+      mfn,
+      call.dispatchType,
+      call.method.name,
+      targetName,
+      ext
+    )
+  }
+  import java.nio.file.{Files, Paths}
+  Files.write(Paths.get(outFile), rows.asJson.spaces2.getBytes("UTF-8"))
+}
+"""
 
 DEFAULT_SINK_FILTER = (
     r"(?i)(strcpy|strncpy|strcat|strncat|memcpy|memmove|gets|scanf|sscanf|fscanf|"
@@ -209,6 +249,19 @@ def _cache_key(
     digest.update(str(sink_filter or "").encode("utf-8"))
     digest.update(str(Path(joern_cli_dir)).encode("utf-8"))
     digest.update(str(bool(retry_without_sink_filter)).encode("utf-8"))
+    return digest.hexdigest()
+
+
+def _calls_cache_key(
+    *,
+    code_text: str,
+    joern_language: str,
+    joern_cli_dir: Path,
+) -> str:
+    digest = hashlib.sha256()
+    digest.update(code_text.encode("utf-8"))
+    digest.update(joern_language.encode("utf-8"))
+    digest.update(str(Path(joern_cli_dir)).encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -729,3 +782,79 @@ def aggregate_line_scores_to_weights(payload: Dict[str, Any]) -> Dict[int, float
         for line_no, score in raw.items()
         if float(score) > 0.0 and int(line_no) > 0
     }
+
+
+def extract_joern_call_rows(
+    *,
+    code_text: str,
+    language_hint: Optional[str] = None,
+    source_path: Optional[Path] = None,
+    prompt_text: str = "",
+    joern_cli_dir: Path = DEFAULT_JOERN_CLI_DIR,
+    cache_dir: Path = CALLS_CACHE_DIR,
+    timeout_sec: int = 180,
+) -> list[Dict[str, Any]]:
+    joern_language = infer_joern_language(
+        language_hint=language_hint,
+        source_path=source_path,
+        prompt_text=prompt_text,
+    )
+    cache_dir = Path(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    cache_path = cache_dir / (
+        _calls_cache_key(
+            code_text=code_text,
+            joern_language=joern_language,
+            joern_cli_dir=Path(joern_cli_dir),
+        )
+        + ".json"
+    )
+    if cache_path.is_file():
+        return list(json.loads(cache_path.read_text(encoding="utf-8")))
+
+    frontend_name = FRONTEND_COMMANDS.get(joern_language)
+    if not frontend_name:
+        raise JoernSliceError(f"No Joern frontend configured for language {joern_language!r}.")
+    frontend = Path(joern_cli_dir) / frontend_name
+    if not frontend.is_file():
+        raise JoernSliceError(
+            f"Required Joern frontend is missing for language {joern_language!r}: {frontend}"
+        )
+    joern_bin = Path(joern_cli_dir) / "joern"
+    if not joern_bin.is_file():
+        raise JoernSliceError(f"Required Joern script runner is missing: {joern_bin}")
+
+    with tempfile.TemporaryDirectory(prefix="joern-calls-") as tmp:
+        tmpdir = Path(tmp)
+        ext = infer_source_extension(joern_language=joern_language, source_path=source_path)
+        file_name = source_path.name if source_path is not None else f"snippet{ext}"
+        src_path = tmpdir / file_name
+        src_path.write_text(code_text, encoding="utf-8")
+        cpg_path = tmpdir / "cpg.bin"
+        frontend_input = tmpdir if joern_language in SOURCE_DIR_LANGUAGES else src_path
+        _run_checked(
+            [str(frontend), str(frontend_input), "--output", str(cpg_path)],
+            cwd=tmpdir,
+            timeout_sec=timeout_sec,
+        )
+        script_path = tmpdir / "query_calls.sc"
+        script_path.write_text(CALL_ROWS_SCRIPT, encoding="utf-8")
+        out_path = tmpdir / "calls.json"
+        _run_checked(
+            [
+                str(joern_bin),
+                "--script",
+                str(script_path),
+                "--param",
+                f"cpgFile={str(cpg_path)}",
+                "--param",
+                f"outFile={str(out_path)}",
+            ],
+            cwd=tmpdir,
+            timeout_sec=timeout_sec,
+        )
+        if not out_path.is_file():
+            raise JoernSliceError(f"Joern call query output missing: {out_path}")
+        rows = list(json.loads(out_path.read_text(encoding="utf-8")))
+        cache_path.write_text(json.dumps(rows, indent=2), encoding="utf-8")
+        return rows

@@ -64,6 +64,8 @@ def main() -> int:
         print(f"argument_slice_counts={gadget.get('argument_slice_counts')}")
         print("--- code_gadget ---")
         print(str(gadget.get("code_gadget") or ""))
+        print("--- symbolic_code_gadget ---")
+        print(str(gadget.get("symbolic_code_gadget") or ""))
     return 0
 
 

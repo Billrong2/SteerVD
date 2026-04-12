@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import random
 import re
 import time
+from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
@@ -11,11 +13,13 @@ from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 from .joern_slice import (
     DEFAULT_CACHE_DIR as DEFAULT_JOERN_CACHE_DIR,
     DEFAULT_JOERN_CLI_DIR,
+    extract_joern_call_rows,
     extract_joern_variable_slices,
 )
 
 
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "code_gadget"
+CODE_GADGET_CACHE_VERSION = "v3_joern_explicit_api_calls"
 
 CONTROL_KEYWORDS = {
     "if",
@@ -82,6 +86,18 @@ class CallCandidate:
     statement_text: str
     arg_texts: List[str]
     arg_identifiers: List[List[str]]
+    caller_method_name: str = ""
+    target_method_name: str = ""
+    method_full_name: str = ""
+    dispatch_type: str = ""
+    is_external_target: bool = False
+
+
+@dataclass(frozen=True)
+class FunctionScope:
+    name: str
+    start_line: int
+    end_line: int
 
 
 def _cache_key(
@@ -100,6 +116,7 @@ def _cache_key(
     digest.update(str(int(slice_depth)).encode("utf-8"))
     digest.update(str(int(parallelism)).encode("utf-8"))
     digest.update(str(int(timeout_sec)).encode("utf-8"))
+    digest.update(CODE_GADGET_CACHE_VERSION.encode("utf-8"))
     return digest.hexdigest()
 
 
@@ -110,6 +127,11 @@ def _strip_comments(text: str) -> str:
 
 def _source_lines(code_text: str) -> Dict[int, str]:
     return {idx: line.rstrip("\n") for idx, line in enumerate(str(code_text or "").splitlines(), start=1)}
+
+
+def _ascii_no_comments(text: str) -> str:
+    cleaned = _strip_comments(str(text or ""))
+    return cleaned.encode("ascii", errors="ignore").decode("ascii")
 
 
 def _normalize_call_name(raw_name: str) -> str:
@@ -190,6 +212,22 @@ def _looks_like_function_definition(statement_text: str) -> bool:
     return True
 
 
+def _extract_function_name(statement_text: str) -> Optional[str]:
+    cleaned = _strip_comments(statement_text)
+    matches = list(CALL_NAME_RE.finditer(cleaned))
+    if not matches:
+        return None
+    return _normalize_call_name(matches[-1].group(1))
+
+
+def _statement_lookup_by_line(code_text: str) -> Dict[int, str]:
+    lookup: Dict[int, str] = {}
+    for start_line, end_line, statement_text in _split_statements(code_text):
+        for line_no in range(int(start_line), int(end_line) + 1):
+            lookup[int(line_no)] = statement_text
+    return lookup
+
+
 def _split_statements(code_text: str) -> List[Tuple[int, int, str]]:
     source_lines = str(code_text or "").splitlines()
     statements: List[Tuple[int, int, str]] = []
@@ -234,33 +272,272 @@ def _split_statements(code_text: str) -> List[Tuple[int, int, str]]:
     return statements
 
 
-def _iter_call_candidates(code_text: str) -> Iterable[CallCandidate]:
-    for start_line, _, statement_text in _split_statements(code_text):
-        if not statement_text or _looks_like_function_definition(statement_text):
+def _collect_function_scopes(code_text: str) -> List[FunctionScope]:
+    raw_lines = str(code_text or "").splitlines()
+    scopes: List[FunctionScope] = []
+    for start_line, end_line, statement_text in _split_statements(code_text):
+        if not _looks_like_function_definition(statement_text):
             continue
-        cleaned = _strip_comments(statement_text)
-        for match in CALL_NAME_RE.finditer(cleaned):
-            raw_name = match.group(1).strip()
-            normalized_name = _normalize_call_name(raw_name)
-            if normalized_name.lower() in CONTROL_KEYWORDS:
+        fn_name = _extract_function_name(statement_text)
+        if not fn_name:
+            continue
+        depth = 0
+        current_end = end_line
+        for line_no in range(start_line, len(raw_lines) + 1):
+            cleaned = _strip_comments(raw_lines[line_no - 1])
+            depth += cleaned.count("{") - cleaned.count("}")
+            current_end = line_no
+            if line_no >= end_line and depth <= 0:
+                break
+        scopes.append(FunctionScope(name=fn_name, start_line=int(start_line), end_line=int(current_end)))
+    return scopes
+
+
+def _line_to_function_map(scopes: Sequence[FunctionScope]) -> Dict[int, str]:
+    mapping: Dict[int, str] = {}
+    for scope in scopes:
+        for line_no in range(int(scope.start_line), int(scope.end_line) + 1):
+            mapping[int(line_no)] = str(scope.name)
+    return mapping
+
+
+def _build_function_call_graph(
+    all_calls: Sequence[CallCandidate],
+    *,
+    user_defined_functions: Sequence[str],
+) -> Dict[str, List[str]]:
+    user_defined = {str(name) for name in user_defined_functions if str(name)}
+    outgoing: Dict[str, set[str]] = defaultdict(set)
+    for candidate in all_calls:
+        caller = str(candidate.caller_method_name or "")
+        callee = str(candidate.target_method_name or candidate.normalized_name or "")
+        if not caller or not callee or callee not in user_defined or caller == callee:
+            continue
+        outgoing[str(caller)].add(callee)
+    return {name: sorted(targets) for name, targets in outgoing.items()}
+
+
+def _ordered_function_pieces(
+    function_names: Sequence[str],
+    *,
+    function_call_graph: Dict[str, List[str]],
+    seed: int,
+) -> List[str]:
+    nodes = [str(name) for name in function_names if str(name)]
+    node_set = set(nodes)
+    indegree: Dict[str, int] = {name: 0 for name in node_set}
+    outgoing: Dict[str, set[str]] = {name: set() for name in node_set}
+    for src in node_set:
+        for dst in function_call_graph.get(src, []):
+            if dst not in node_set or dst == src:
                 continue
-            open_idx = cleaned.find("(", match.start())
-            if open_idx < 0:
+            if dst in outgoing[src]:
                 continue
-            close_idx = _find_matching_paren(cleaned, open_idx)
-            if close_idx is None:
+            outgoing[src].add(dst)
+            indegree[dst] += 1
+
+    rng = random.Random(int(seed))
+    ready = [name for name in node_set if indegree[name] == 0]
+    rng.shuffle(ready)
+    ordered: List[str] = []
+    while ready:
+        current = ready.pop(0)
+        ordered.append(current)
+        next_ready: List[str] = []
+        for dst in sorted(outgoing[current]):
+            indegree[dst] -= 1
+            if indegree[dst] == 0:
+                next_ready.append(dst)
+        rng.shuffle(next_ready)
+        ready.extend(next_ready)
+
+    remaining = [name for name in nodes if name not in ordered]
+    if remaining:
+        rng.shuffle(remaining)
+        ordered.extend(remaining)
+    return ordered
+
+
+def _assemble_code_gadget(
+    *,
+    line_numbers: Sequence[int],
+    source_map: Dict[int, str],
+    line_to_function: Dict[int, str],
+    function_call_graph: Dict[str, List[str]],
+    seed: int,
+) -> Tuple[List[int], List[Dict[str, Any]]]:
+    deduped_lines = sorted({int(line_no) for line_no in line_numbers if int(line_no) > 0})
+    pieces_by_function: Dict[str, List[int]] = defaultdict(list)
+    unscoped_lines: List[int] = []
+    for line_no in deduped_lines:
+        owner = line_to_function.get(int(line_no))
+        if owner:
+            pieces_by_function[str(owner)].append(int(line_no))
+        else:
+            unscoped_lines.append(int(line_no))
+
+    ordered_functions = _ordered_function_pieces(
+        sorted(pieces_by_function.keys()),
+        function_call_graph=function_call_graph,
+        seed=seed,
+    )
+
+    assembled_sequence: List[int] = []
+    piece_summaries: List[Dict[str, Any]] = []
+    if unscoped_lines:
+        assembled_sequence.extend(unscoped_lines)
+        piece_summaries.append(
+            {
+                "function_name": None,
+                "line_sequence": list(unscoped_lines),
+                "text": "\n".join(source_map.get(line_no, "") for line_no in unscoped_lines),
+            }
+        )
+
+    for function_name in ordered_functions:
+        piece_lines = sorted({int(line_no) for line_no in pieces_by_function.get(function_name, []) if int(line_no) > 0})
+        if not piece_lines:
+            continue
+        assembled_sequence.extend(piece_lines)
+        piece_summaries.append(
+            {
+                "function_name": str(function_name),
+                "line_sequence": list(piece_lines),
+                "text": "\n".join(source_map.get(line_no, "") for line_no in piece_lines),
+            }
+        )
+
+    return assembled_sequence, piece_summaries
+
+
+def _ordered_symbol_names(lines: Sequence[str], candidates: Sequence[str], *, prefix: str) -> Dict[str, str]:
+    normalized_candidates = [str(name) for name in candidates if str(name)]
+    mapping: Dict[str, str] = {}
+    for line in lines:
+        for match in IDENT_RE.finditer(str(line or "")):
+            token = match.group(0)
+            if token not in normalized_candidates:
                 continue
-            arg_blob = cleaned[open_idx + 1 : close_idx]
-            arg_texts = _split_top_level_args(arg_blob)
-            call_line = start_line + cleaned[: match.start()].count("\n")
-            yield CallCandidate(
-                raw_name=raw_name,
-                normalized_name=normalized_name,
-                line_number=int(call_line),
-                statement_text=statement_text,
-                arg_texts=arg_texts,
-                arg_identifiers=[_extract_identifiers(part) for part in arg_texts],
-            )
+            if token in mapping:
+                continue
+            mapping[token] = f"{prefix}{len(mapping) + 1}"
+    return mapping
+
+
+def _symbolic_code_gadget(
+    *,
+    assembled_lines: Sequence[int],
+    source_map: Dict[int, str],
+    user_defined_functions: Sequence[str],
+    api_call_names: Sequence[str],
+) -> Tuple[str, Dict[str, Any]]:
+    raw_lines = [_ascii_no_comments(source_map.get(int(line_no), "")) for line_no in assembled_lines]
+    cleaned_lines = [line.rstrip() for line in raw_lines if line.strip()]
+
+    function_mapping = _ordered_symbol_names(
+        cleaned_lines,
+        [name for name in user_defined_functions if str(name) != "main"],
+        prefix="FUN",
+    )
+
+    api_names = {str(name) for name in api_call_names if str(name)}
+    variable_candidates: List[str] = []
+    seen_variables = set()
+    for line in cleaned_lines:
+        for match in IDENT_RE.finditer(line):
+            token = match.group(0)
+            lowered = token.lower()
+            if lowered in IDENTIFIER_BLACKLIST:
+                continue
+            if token in function_mapping:
+                continue
+            if token in api_names:
+                continue
+            if token.isupper():
+                continue
+            if token in seen_variables:
+                continue
+            seen_variables.add(token)
+            variable_candidates.append(token)
+
+    variable_mapping = {token: f"VAR{idx}" for idx, token in enumerate(variable_candidates, start=1)}
+
+    rendered_lines: List[str] = []
+    for line in cleaned_lines:
+        rendered = line
+        for original, replacement in function_mapping.items():
+            rendered = re.sub(rf"\b{re.escape(original)}\b", replacement, rendered)
+        for original, replacement in variable_mapping.items():
+            rendered = re.sub(rf"\b{re.escape(original)}\b", replacement, rendered)
+        rendered_lines.append(rendered)
+
+    return "\n".join(rendered_lines), {
+        "function_mapping": function_mapping,
+        "variable_mapping": variable_mapping,
+    }
+
+
+def _parse_call_text(raw_call_name: str, call_code: str) -> Tuple[List[str], List[List[str]]]:
+    cleaned = _strip_comments(str(call_code or "")).strip()
+    if not cleaned:
+        return [], []
+    match = CALL_NAME_RE.search(cleaned)
+    if not match:
+        return [], []
+    open_idx = cleaned.find("(", match.start())
+    if open_idx < 0:
+        return [], []
+    close_idx = _find_matching_paren(cleaned, open_idx)
+    if close_idx is None:
+        return [], []
+    arg_blob = cleaned[open_idx + 1 : close_idx]
+    arg_texts = _split_top_level_args(arg_blob)
+    return arg_texts, [_extract_identifiers(part) for part in arg_texts]
+
+
+def _call_candidate_from_joern_row(
+    row: Dict[str, Any],
+    *,
+    statement_lookup: Dict[int, str],
+) -> Optional[CallCandidate]:
+    raw_name = str(row.get("name") or "")
+    normalized_name = _normalize_call_name(raw_name)
+    if not raw_name or not normalized_name:
+        return None
+    if normalized_name.lower() in CONTROL_KEYWORDS:
+        return None
+    line_number = int(row.get("line") or -1)
+    if line_number <= 0:
+        return None
+    call_code = str(row.get("code") or "")
+    statement_text = str(statement_lookup.get(line_number) or call_code or "")
+    arg_texts, arg_identifiers = _parse_call_text(raw_name, call_code)
+    return CallCandidate(
+        raw_name=raw_name,
+        normalized_name=normalized_name,
+        line_number=line_number,
+        statement_text=statement_text,
+        arg_texts=arg_texts,
+        arg_identifiers=arg_identifiers,
+        caller_method_name=str(row.get("callerMethodName") or ""),
+        target_method_name=str(row.get("targetMethodName") or ""),
+        method_full_name=str(row.get("methodFullName") or ""),
+        dispatch_type=str(row.get("dispatchType") or ""),
+        is_external_target=bool(row.get("isExternalTarget")),
+    )
+
+
+def _select_api_call_candidates(all_calls: Sequence[CallCandidate]) -> List[CallCandidate]:
+    selected: List[CallCandidate] = []
+    for candidate in all_calls:
+        if not candidate.is_external_target:
+            continue
+        if str(candidate.raw_name).startswith("<operator>."):
+            continue
+        if not candidate.arg_texts and "(" not in candidate.statement_text:
+            continue
+        selected.append(candidate)
+    return selected
 
 
 def _call_direction(candidate: CallCandidate, *, default_direction: str) -> str:
@@ -341,7 +618,30 @@ def extract_code_gadget_payload(
         return json.loads(cache_path.read_text(encoding="utf-8"))
 
     source_map = _source_lines(code_text)
-    call_candidates = list(_iter_call_candidates(code_text))
+    statement_lookup = _statement_lookup_by_line(code_text)
+    joern_call_rows = extract_joern_call_rows(
+        code_text=str(code_text or ""),
+        prompt_text=str(prompt_text or ""),
+        joern_cli_dir=Path(joern_cli_dir),
+        timeout_sec=max(1, int(timeout_sec)),
+    )
+    all_calls = [
+        candidate
+        for candidate in (
+            _call_candidate_from_joern_row(row, statement_lookup=statement_lookup)
+            for row in joern_call_rows
+            if isinstance(row, dict)
+        )
+        if candidate is not None
+    ]
+    call_candidates = _select_api_call_candidates(all_calls)
+    function_scopes = _collect_function_scopes(code_text)
+    line_to_function = _line_to_function_map(function_scopes)
+    user_defined_functions = [scope.name for scope in function_scopes]
+    function_call_graph = _build_function_call_graph(
+        all_calls,
+        user_defined_functions=user_defined_functions,
+    )
     directions_needed = sorted({_call_direction(candidate, default_direction=direction) for candidate in call_candidates} or {str(direction or "backward").lower()})
 
     payloads_by_direction: Dict[str, Dict[str, Any]] = {}
@@ -373,6 +673,7 @@ def extract_code_gadget_payload(
         variable_slices = list(slice_payload.get("variable_slices") or [])
 
         matched_entries: List[Dict[str, Any]] = []
+        matched_global_keys = set()
         argument_slice_counts: List[int] = []
         for arg_idents in candidate.arg_identifiers:
             matches: List[Dict[str, Any]] = []
@@ -391,14 +692,37 @@ def extract_code_gadget_payload(
                 seen.add(key)
                 matches.append(entry)
             argument_slice_counts.append(int(len(matches)))
-            matched_entries.extend(matches)
+            for entry in matches:
+                key = (
+                    str(entry.get("variable_key") or ""),
+                    tuple(int(x) for x in (entry.get("anchor_lines") or []) if int(x) > 0),
+                )
+                if key in matched_global_keys:
+                    continue
+                matched_global_keys.add(key)
+                matched_entries.append(entry)
+
+        if not matched_entries:
+            continue
 
         line_scores = _build_line_scores_from_argument_slices(
             call_line=candidate.line_number,
             matched_slices=matched_entries,
         )
-        line_sequence = sorted(set(int(candidate.line_number) for _ in [0]) | {int(line_no) for line_no in line_scores.keys() if int(line_no) > 0})
+        line_sequence, function_pieces = _assemble_code_gadget(
+            line_numbers=sorted(set(int(candidate.line_number) for _ in [0]) | {int(line_no) for line_no in line_scores.keys() if int(line_no) > 0}),
+            source_map=source_map,
+            line_to_function=line_to_function,
+            function_call_graph=function_call_graph,
+            seed=int(hashlib.sha256(f"{candidate.raw_name}:{candidate.line_number}".encode("utf-8")).hexdigest()[:8], 16),
+        )
         code_gadget_text = "\n".join(source_map.get(line_no, "") for line_no in line_sequence if line_no in source_map)
+        symbolic_code_gadget, symbolic_mappings = _symbolic_code_gadget(
+            assembled_lines=line_sequence,
+            source_map=source_map,
+            user_defined_functions=user_defined_functions,
+            api_call_names=[entry.normalized_name for entry in call_candidates],
+        )
         code_gadgets.append(
             {
                 "gadget_index": int(gadget_index),
@@ -413,7 +737,10 @@ def extract_code_gadget_payload(
                 "source_variable_slices": int(len(matched_entries)),
                 "line_sequence": line_sequence,
                 "line_scores": line_scores,
+                "function_pieces": function_pieces,
                 "code_gadget": code_gadget_text,
+                "symbolic_code_gadget": symbolic_code_gadget,
+                "symbolic_mappings": symbolic_mappings,
             }
         )
 
@@ -436,8 +763,12 @@ def extract_code_gadget_payload(
             "construction": "vuldeepecker",
             "default_direction": str(direction or "backward").lower(),
             "include_control": bool(include_control),
+            "symbolic_transform": True,
             "gadget_count": int(len(code_gadgets)),
             "call_count": int(len(call_candidates)),
+            "api_call_count": int(len(call_candidates)),
+            "all_call_count": int(len(all_calls)),
+            "function_scope_count": int(len(function_scopes)),
             "joern_errors": dict(joern_errors),
             "per_direction_summaries": {
                 active_direction: _summarize_slice_payload(payload)
