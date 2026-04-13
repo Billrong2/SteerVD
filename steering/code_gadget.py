@@ -2,9 +2,12 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import random
 import re
+import subprocess
 import time
+from fnmatch import fnmatchcase
 from collections import defaultdict
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,12 +17,17 @@ from .joern_slice import (
     DEFAULT_CACHE_DIR as DEFAULT_JOERN_CACHE_DIR,
     DEFAULT_JOERN_CLI_DIR,
     extract_joern_call_rows,
-    extract_joern_variable_slices,
+    extract_joern_external_call_argument_flows,
+    extract_joern_method_rows,
+    extract_joern_user_symbol_rows,
+    generate_joern_slice_graph,
 )
 
 
 DEFAULT_CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "code_gadget"
-CODE_GADGET_CACHE_VERSION = "v3_joern_explicit_api_calls"
+DEFAULT_PROJECT_CACHE_DIR = Path(__file__).resolve().parent / ".cache" / "project_context"
+DEFAULT_PROJECT_REPO_MAP_PATH = Path(__file__).resolve().parents[1] / "Source" / "project_repo_urls.json"
+CODE_GADGET_CACHE_VERSION = "v17_joern_only_revert"
 
 CONTROL_KEYWORDS = {
     "if",
@@ -53,29 +61,134 @@ IDENTIFIER_BLACKLIST = CONTROL_KEYWORDS | {
     "double",
     "bool",
 }
-FORWARD_API_CALLS = {
-    "recv",
-    "recvfrom",
-    "recvmsg",
-    "read",
-    "fread",
+PAPER_FORWARD_API_PATTERNS = {
+    "cin",
+    "getenv",
+    "getenv_s",
+    "wgetenv",
+    "wgetenv_s",
+    "catgets",
     "gets",
-    "fgets",
-    "getline",
-    "getdelim",
+    "getchar",
+    "getc",
+    "getch",
+    "getche",
+    "kbhit",
+    "getdlgtext",
+    "getpass",
     "scanf",
-    "sscanf",
     "fscanf",
     "vscanf",
     "vfscanf",
-    "vsscanf",
+    "get",
+    "getline",
+    "peek",
+    "read*",
+    "putback",
+    "sbumpc",
+    "sgetc",
+    "sgetn",
+    "snextc",
+    "sputbackc",
+    "sendmessage",
+    "sendmessagecallback",
+    "sendnotifymessage",
+    "postmessage",
+    "postthreadmessage",
+    "recv",
+    "recvfrom",
+    "recvmsg",
+    "receive",
+    "receivefrom",
+    "receivefromex",
+    "receive*",
+    "fgets",
+    "sscanf",
+    "swscanf",
+    "sscanf_s",
+    "swscanf_s",
+    "winmain",
+    "getrawinput*",
+    "getcomboboxinfo",
+    "getwindowtext",
+    "getkeynametext",
+    "dde*",
+    "getfilemui*",
+    "getlocaleinfo*",
+    "getstring*",
+    "getcursor*",
+    "getscroll*",
+    "getdlgitem*",
+    "getmenuitem*",
+}
+FORWARD_BUFFER_ARG_PATTERNS: Tuple[Tuple[str, Tuple[int, ...]], ...] = (
+    ("recv", (2,)),
+    ("recvfrom", (2,)),
+    ("recvmsg", (2,)),
+    ("receive", (1,)),
+    ("receivefrom", (2,)),
+    ("receivefromex", (2,)),
+    ("receive*", (1, 2)),
+    ("read", (2,)),
+    ("read*", (2,)),
+    ("fread", (1,)),
+    ("gets", (1,)),
+    ("fgets", (1,)),
+    ("getline", (1, 2)),
+    ("getdelim", (1, 2)),
+    ("scanf", (2,)),
+    ("fscanf", (3,)),
+    ("vscanf", (2,)),
+    ("vfscanf", (3,)),
+    ("sscanf", (3,)),
+    ("swscanf", (3,)),
+    ("sscanf_s", (3,)),
+    ("swscanf_s", (3,)),
+    ("getdlgtext", (2,)),
+    ("getwindowtext", (2,)),
+    ("getkeynametext", (2,)),
+    ("getlocaleinfo*", (3,)),
+    ("getrawinput*", (3,)),
+)
+FORWARD_RETURN_SOURCE_PATTERNS = {
+    "catgets",
+    "getc",
+    "getchar",
+    "getch",
+    "getche",
     "getenv",
+    "getenv_s",
+    "wgetenv",
+    "wgetenv_s",
+    "getpass",
+    "peek",
+    "sbumpc",
+    "sgetc",
+    "sgetn",
+    "snextc",
+    "putback",
+    "get",
+    "getstring*",
 }
 
 CALL_NAME_RE = re.compile(r"([A-Za-z_][A-Za-z0-9_]*(?:(?:::|->|\.)[A-Za-z_][A-Za-z0-9_]*)*)\s*\(")
 IDENT_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 LINE_COMMENT_RE = re.compile(r"//.*?$", flags=re.MULTILINE)
 BLOCK_COMMENT_RE = re.compile(r"/\*.*?\*/", flags=re.DOTALL)
+WHITESPACE_RE = re.compile(r"\s+")
+TOKEN_RE = re.compile(
+    r"""
+    [A-Za-z_][A-Za-z0-9_]* |
+    0x[0-9A-Fa-f]+ |
+    \d+\.\d+ |
+    \d+ |
+    ==|!=|<=|>=|->|::|\+\+|--|&&|\|\||<<|>>|[-+*/%&|^~!=<>?:;.,()[\]{}]
+    """,
+    flags=re.VERBOSE,
+)
+CPP_EXTENSIONS = {".c", ".cc", ".cpp", ".cxx", ".h", ".hh", ".hpp", ".hxx"}
+GRAPH_VARIABLE_LABELS = {"IDENTIFIER", "METHOD_PARAMETER_IN", "LOCAL"}
+GRAPH_FLOW_LABEL = "REACHING_DEF"
 
 
 @dataclass(frozen=True)
@@ -94,16 +207,38 @@ class CallCandidate:
 
 
 @dataclass(frozen=True)
+class UserSymbol:
+    kind: str
+    name: str
+    line_number: int
+    parent_method_name: str
+    order: int = -1
+
+
+@dataclass(frozen=True)
 class FunctionScope:
     name: str
     start_line: int
     end_line: int
 
 
+@dataclass(frozen=True)
+class ProjectContext:
+    project_name: str
+    commit_id: str
+    checkout_root: Path
+    source_path: Path
+    source_text: str
+    snippet_start_line: int
+    snippet_end_line: int
+
+
 def _cache_key(
     *,
     code_text: str,
-    default_direction: str,
+    project_name: Optional[str],
+    commit_id: Optional[str],
+    strict_project_context: bool,
     max_hops: Optional[int],
     slice_depth: int,
     parallelism: int,
@@ -111,7 +246,9 @@ def _cache_key(
 ) -> str:
     digest = hashlib.sha256()
     digest.update(str(code_text or "").encode("utf-8"))
-    digest.update(str(default_direction or "").encode("utf-8"))
+    digest.update(str(project_name or "").encode("utf-8"))
+    digest.update(str(commit_id or "").encode("utf-8"))
+    digest.update(str(bool(strict_project_context)).encode("utf-8"))
     digest.update(str(max_hops).encode("utf-8"))
     digest.update(str(int(slice_depth)).encode("utf-8"))
     digest.update(str(int(parallelism)).encode("utf-8"))
@@ -127,6 +264,227 @@ def _strip_comments(text: str) -> str:
 
 def _source_lines(code_text: str) -> Dict[int, str]:
     return {idx: line.rstrip("\n") for idx, line in enumerate(str(code_text or "").splitlines(), start=1)}
+
+
+def _run_checked(cmd: Sequence[str], *, cwd: Optional[Path] = None, timeout_sec: int = 180) -> subprocess.CompletedProcess[str]:
+    try:
+        proc = subprocess.run(
+            list(cmd),
+            cwd=str(cwd) if cwd is not None else None,
+            capture_output=True,
+            text=True,
+            timeout=max(1, int(timeout_sec)),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise RuntimeError(
+            f"Command timed out: {' '.join(map(str, cmd))}\nstdout:\n{exc.stdout or ''}\nstderr:\n{exc.stderr or ''}"
+        ) from exc
+    if proc.returncode != 0:
+        raise RuntimeError(
+            f"Command failed: {' '.join(map(str, cmd))}\nstdout:\n{proc.stdout}\nstderr:\n{proc.stderr}"
+        )
+    return proc
+
+
+def _safe_project_key(project_name: str) -> str:
+    safe = re.sub(r"[^A-Za-z0-9._-]+", "_", str(project_name or "").strip().lower())
+    return safe or "project"
+
+
+def _load_project_repo_map(path: Optional[Path]) -> Dict[str, str]:
+    resolved = Path(path).expanduser() if path is not None else DEFAULT_PROJECT_REPO_MAP_PATH
+    if not resolved.is_file():
+        return {}
+    payload = json.loads(resolved.read_text(encoding="utf-8"))
+    if not isinstance(payload, dict):
+        return {}
+    out: Dict[str, str] = {}
+    for key, value in payload.items():
+        if not isinstance(value, str) or not value.strip():
+            continue
+        out[_safe_project_key(str(key))] = value.strip()
+    return out
+
+
+def _candidate_local_repos(project_name: str, project_source_root: Optional[Path]) -> List[Path]:
+    if project_source_root is None:
+        return []
+    root = Path(project_source_root).expanduser()
+    if not root.is_dir():
+        return []
+    safe_key = _safe_project_key(project_name)
+    wanted = {str(project_name or "").strip().lower(), safe_key}
+    candidates: List[Path] = []
+    direct = root / str(project_name or "")
+    if direct.is_dir():
+        candidates.append(direct)
+    for child in root.iterdir():
+        if not child.is_dir():
+            continue
+        if child.name.lower() in wanted or _safe_project_key(child.name) == safe_key:
+            candidates.append(child)
+    unique: List[Path] = []
+    seen = set()
+    for path in candidates:
+        real = path.resolve()
+        if real in seen:
+            continue
+        seen.add(real)
+        unique.append(real)
+    return unique
+
+
+def _git_has_commit(repo_root: Path, commit_id: str) -> bool:
+    proc = subprocess.run(
+        ["git", "-C", str(repo_root), "cat-file", "-e", f"{commit_id}^{{commit}}"],
+        capture_output=True,
+        text=True,
+    )
+    return proc.returncode == 0
+
+
+def _ensure_project_repo(
+    *,
+    project_name: str,
+    commit_id: str,
+    project_source_root: Optional[Path],
+    project_cache_dir: Path,
+    project_repo_map_path: Optional[Path],
+    timeout_sec: int,
+) -> Path:
+    for candidate in _candidate_local_repos(project_name, project_source_root):
+        if (candidate / ".git").exists() or subprocess.run(
+            ["git", "-C", str(candidate), "rev-parse", "--is-inside-work-tree"],
+            capture_output=True,
+            text=True,
+        ).returncode == 0:
+            if _git_has_commit(candidate, commit_id):
+                return candidate
+
+    repo_map = _load_project_repo_map(project_repo_map_path)
+    repo_url = repo_map.get(_safe_project_key(project_name))
+    if not repo_url:
+        raise RuntimeError(
+            f"Strict project context requires a local repo or repo URL mapping for project={project_name!r}."
+        )
+
+    project_cache_dir.mkdir(parents=True, exist_ok=True)
+    repo_root = project_cache_dir / "repos" / _safe_project_key(project_name)
+    if not repo_root.exists():
+        repo_root.parent.mkdir(parents=True, exist_ok=True)
+        _run_checked(["git", "clone", "--no-checkout", repo_url, str(repo_root)], timeout_sec=timeout_sec)
+    _run_checked(["git", "-C", str(repo_root), "fetch", "--all", "--tags", "--prune"], timeout_sec=timeout_sec)
+    if not _git_has_commit(repo_root, commit_id):
+        _run_checked(["git", "-C", str(repo_root), "fetch", "origin", commit_id], timeout_sec=timeout_sec)
+    if not _git_has_commit(repo_root, commit_id):
+        raise RuntimeError(f"Commit {commit_id} not found for project={project_name!r}.")
+    return repo_root
+
+
+def _ensure_detached_worktree(repo_root: Path, *, project_name: str, commit_id: str, project_cache_dir: Path, timeout_sec: int) -> Path:
+    worktree_root = project_cache_dir / "worktrees" / _safe_project_key(project_name) / str(commit_id)
+    if worktree_root.is_dir():
+        return worktree_root
+    worktree_root.parent.mkdir(parents=True, exist_ok=True)
+    _run_checked(
+        ["git", "-C", str(repo_root), "worktree", "add", "--detach", str(worktree_root), str(commit_id)],
+        timeout_sec=timeout_sec,
+    )
+    return worktree_root
+
+
+def _normalized_nonempty_lines(text: str) -> List[Tuple[int, str]]:
+    out: List[Tuple[int, str]] = []
+    for line_no, raw in enumerate(str(text or "").splitlines(), start=1):
+        cleaned = _ascii_no_comments(raw)
+        collapsed = WHITESPACE_RE.sub(" ", cleaned).strip()
+        if not collapsed:
+            continue
+        out.append((line_no, collapsed))
+    return out
+
+
+def _match_snippet_in_text(text: str, snippet: str) -> Optional[Tuple[int, int]]:
+    body = str(snippet or "").strip("\n")
+    if not body.strip():
+        return None
+    raw_idx = str(text or "").find(body)
+    if raw_idx >= 0:
+        start_line = str(text or "")[:raw_idx].count("\n") + 1
+        line_count = body.count("\n") + 1
+        return start_line, start_line + line_count - 1
+
+    file_lines = _normalized_nonempty_lines(text)
+    snippet_lines = [line for _, line in _normalized_nonempty_lines(body)]
+    if not snippet_lines or len(snippet_lines) > len(file_lines):
+        return None
+    wanted = "\n".join(snippet_lines)
+    for idx in range(0, len(file_lines) - len(snippet_lines) + 1):
+        candidate = "\n".join(line for _, line in file_lines[idx : idx + len(snippet_lines)])
+        if candidate != wanted:
+            continue
+        return file_lines[idx][0], file_lines[idx + len(snippet_lines) - 1][0]
+    return None
+
+
+def _locate_snippet_in_checkout(checkout_root: Path, code_text: str) -> Tuple[Path, str, int, int]:
+    matches: List[Tuple[Path, str, int, int]] = []
+    for path in checkout_root.rglob("*"):
+        if not path.is_file():
+            continue
+        if path.suffix.lower() not in CPP_EXTENSIONS:
+            continue
+        try:
+            text = path.read_text(encoding="utf-8", errors="ignore")
+        except OSError:
+            continue
+        span = _match_snippet_in_text(text, code_text)
+        if span is None:
+            continue
+        start_line, end_line = span
+        matches.append((path, text, start_line, end_line))
+    if not matches:
+        raise RuntimeError("Unable to locate target snippet in the resolved project checkout.")
+    if len(matches) > 1:
+        matches.sort(key=lambda item: (len(item[0].parts), len(item[1]), str(item[0])))
+    return matches[0]
+
+
+def _resolve_project_context(
+    *,
+    code_text: str,
+    project_name: str,
+    commit_id: str,
+    project_source_root: Optional[Path],
+    project_cache_dir: Path,
+    project_repo_map_path: Optional[Path],
+    timeout_sec: int,
+) -> ProjectContext:
+    repo_root = _ensure_project_repo(
+        project_name=project_name,
+        commit_id=commit_id,
+        project_source_root=project_source_root,
+        project_cache_dir=project_cache_dir,
+        project_repo_map_path=project_repo_map_path,
+        timeout_sec=timeout_sec,
+    )
+    checkout_root = _ensure_detached_worktree(
+        repo_root,
+        project_name=project_name,
+        commit_id=commit_id,
+        project_cache_dir=project_cache_dir,
+        timeout_sec=timeout_sec,
+    )
+    source_path, source_text, start_line, end_line = _locate_snippet_in_checkout(checkout_root, code_text)
+    return ProjectContext(
+        project_name=str(project_name),
+        commit_id=str(commit_id),
+        checkout_root=checkout_root,
+        source_path=source_path,
+        source_text=source_text,
+        snippet_start_line=int(start_line),
+        snippet_end_line=int(end_line),
+    )
 
 
 def _ascii_no_comments(text: str) -> str:
@@ -200,97 +558,15 @@ def _extract_identifiers(expr: str) -> List[str]:
     return out
 
 
-def _looks_like_function_definition(statement_text: str) -> bool:
-    stripped = str(statement_text or "").strip()
-    if not stripped.endswith("{"):
-        return False
-    lowered = stripped.lower()
-    if lowered.startswith(("if ", "if(", "for ", "for(", "while ", "while(", "switch ", "switch(", "catch ", "catch(")):
-        return False
-    if "=" in stripped and stripped.find("=") < stripped.find("("):
-        return False
-    return True
-
-
-def _extract_function_name(statement_text: str) -> Optional[str]:
-    cleaned = _strip_comments(statement_text)
-    matches = list(CALL_NAME_RE.finditer(cleaned))
-    if not matches:
-        return None
-    return _normalize_call_name(matches[-1].group(1))
+def _lexical_tokens(text: str) -> List[str]:
+    return [match.group(0) for match in TOKEN_RE.finditer(str(text or ""))]
 
 
 def _statement_lookup_by_line(code_text: str) -> Dict[int, str]:
-    lookup: Dict[int, str] = {}
-    for start_line, end_line, statement_text in _split_statements(code_text):
-        for line_no in range(int(start_line), int(end_line) + 1):
-            lookup[int(line_no)] = statement_text
-    return lookup
-
-
-def _split_statements(code_text: str) -> List[Tuple[int, int, str]]:
-    source_lines = str(code_text or "").splitlines()
-    statements: List[Tuple[int, int, str]] = []
-    buf: List[str] = []
-    start_line: Optional[int] = None
-    paren_depth = bracket_depth = brace_depth = 0
-
-    for line_no, raw_line in enumerate(source_lines, start=1):
-        line = raw_line.rstrip("\n")
-        cleaned = _strip_comments(line)
-        stripped = cleaned.strip()
-
-        if start_line is None and stripped:
-            start_line = line_no
-        if start_line is None:
-            continue
-
-        buf.append(line)
-        paren_depth += cleaned.count("(") - cleaned.count(")")
-        bracket_depth += cleaned.count("[") - cleaned.count("]")
-        brace_depth += cleaned.count("{") - cleaned.count("}")
-
-        if stripped == "}":
-            statements.append((start_line, line_no, "\n".join(buf).strip()))
-            buf = []
-            start_line = None
-            continue
-
-        should_close = False
-        if paren_depth <= 0 and bracket_depth <= 0:
-            if stripped.endswith(";"):
-                should_close = True
-            elif stripped.endswith("{") and _looks_like_function_definition("\n".join(buf)):
-                should_close = True
-        if should_close:
-            statements.append((start_line, line_no, "\n".join(buf).strip()))
-            buf = []
-            start_line = None
-
-    if buf and start_line is not None:
-        statements.append((start_line, len(source_lines), "\n".join(buf).strip()))
-    return statements
-
-
-def _collect_function_scopes(code_text: str) -> List[FunctionScope]:
-    raw_lines = str(code_text or "").splitlines()
-    scopes: List[FunctionScope] = []
-    for start_line, end_line, statement_text in _split_statements(code_text):
-        if not _looks_like_function_definition(statement_text):
-            continue
-        fn_name = _extract_function_name(statement_text)
-        if not fn_name:
-            continue
-        depth = 0
-        current_end = end_line
-        for line_no in range(start_line, len(raw_lines) + 1):
-            cleaned = _strip_comments(raw_lines[line_no - 1])
-            depth += cleaned.count("{") - cleaned.count("}")
-            current_end = line_no
-            if line_no >= end_line and depth <= 0:
-                break
-        scopes.append(FunctionScope(name=fn_name, start_line=int(start_line), end_line=int(current_end)))
-    return scopes
+    return {
+        line_no: line.rstrip("\n")
+        for line_no, line in enumerate(str(code_text or "").splitlines(), start=1)
+    }
 
 
 def _line_to_function_map(scopes: Sequence[FunctionScope]) -> Dict[int, str]:
@@ -430,17 +706,19 @@ def _symbolic_code_gadget(
     source_map: Dict[int, str],
     user_defined_functions: Sequence[str],
     api_call_names: Sequence[str],
+    user_defined_variable_names: Sequence[str],
 ) -> Tuple[str, Dict[str, Any]]:
     raw_lines = [_ascii_no_comments(source_map.get(int(line_no), "")) for line_no in assembled_lines]
     cleaned_lines = [line.rstrip() for line in raw_lines if line.strip()]
 
     function_mapping = _ordered_symbol_names(
         cleaned_lines,
-        [name for name in user_defined_functions if str(name) != "main"],
+        user_defined_functions,
         prefix="FUN",
     )
 
     api_names = {str(name) for name in api_call_names if str(name)}
+    allowed_variables = {str(name) for name in user_defined_variable_names if str(name)}
     variable_candidates: List[str] = []
     seen_variables = set()
     for line in cleaned_lines:
@@ -453,7 +731,7 @@ def _symbolic_code_gadget(
                 continue
             if token in api_names:
                 continue
-            if token.isupper():
+            if token not in allowed_variables:
                 continue
             if token in seen_variables:
                 continue
@@ -511,7 +789,12 @@ def _call_candidate_from_joern_row(
         return None
     call_code = str(row.get("code") or "")
     statement_text = str(statement_lookup.get(line_number) or call_code or "")
-    arg_texts, arg_identifiers = _parse_call_text(raw_name, call_code)
+    raw_arg_texts = row.get("argTexts")
+    if isinstance(raw_arg_texts, list):
+        arg_texts = [str(item) for item in raw_arg_texts]
+        arg_identifiers = [_extract_identifiers(part) for part in arg_texts]
+    else:
+        arg_texts, arg_identifiers = _parse_call_text(raw_name, call_code)
     return CallCandidate(
         raw_name=raw_name,
         normalized_name=normalized_name,
@@ -527,10 +810,22 @@ def _call_candidate_from_joern_row(
     )
 
 
-def _select_api_call_candidates(all_calls: Sequence[CallCandidate]) -> List[CallCandidate]:
+def _select_api_call_candidates(
+    all_calls: Sequence[CallCandidate],
+    *,
+    declaration_only_targets: Optional[set[str]] = None,
+) -> List[CallCandidate]:
+    declaration_only_targets = {
+        str(name)
+        for name in (declaration_only_targets or set())
+        if str(name)
+    }
     selected: List[CallCandidate] = []
     for candidate in all_calls:
-        if not candidate.is_external_target:
+        if (
+            not candidate.is_external_target
+            and str(candidate.target_method_name or "") not in declaration_only_targets
+        ):
             continue
         if str(candidate.raw_name).startswith("<operator>."):
             continue
@@ -540,73 +835,395 @@ def _select_api_call_candidates(all_calls: Sequence[CallCandidate]) -> List[Call
     return selected
 
 
-def _call_direction(candidate: CallCandidate, *, default_direction: str) -> str:
-    if candidate.normalized_name.lower() in FORWARD_API_CALLS:
+def _user_symbols_from_joern_rows(rows: Sequence[Dict[str, Any]]) -> List[UserSymbol]:
+    out: List[UserSymbol] = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        kind = str(row.get("kind") or "")
+        name = str(row.get("name") or "")
+        parent_method_name = str(row.get("parentMethodName") or "")
+        line_number = int(row.get("line") or -1)
+        if not kind or not name or not parent_method_name:
+            continue
+        key = (kind, name, parent_method_name, line_number)
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(
+            UserSymbol(
+                kind=kind,
+                name=name,
+                line_number=line_number,
+                parent_method_name=parent_method_name,
+                order=int(row.get("order") or -1),
+            )
+        )
+    return out
+
+
+def _function_scopes_from_joern_rows(rows: Sequence[Dict[str, Any]]) -> List[FunctionScope]:
+    scopes: List[FunctionScope] = []
+    seen = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        if bool(row.get("isExternal")):
+            continue
+        name = str(row.get("name") or "")
+        if not name or name.startswith("<"):
+            continue
+        start_line = int(row.get("lineStart") or -1)
+        end_line = int(row.get("lineEnd") or -1)
+        if start_line <= 0 or end_line < start_line:
+            continue
+        key = (name, start_line, end_line)
+        if key in seen:
+            continue
+        seen.add(key)
+        scopes.append(FunctionScope(name=name, start_line=start_line, end_line=end_line))
+    scopes.sort(key=lambda scope: (int(scope.start_line), int(scope.end_line), str(scope.name)))
+    return scopes
+
+
+def _declaration_only_method_names(
+    rows: Sequence[Dict[str, Any]],
+    *,
+    source_map: Dict[int, str],
+) -> set[str]:
+    names: set[str] = set()
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        name = str(row.get("name") or "")
+        if not name or name.startswith("<"):
+            continue
+        start_line = int(row.get("lineStart") or -1)
+        end_line = int(row.get("lineEnd") or -1)
+        if start_line <= 0 or end_line <= 0:
+            continue
+        if end_line != start_line:
+            continue
+        line_text = str(source_map.get(start_line) or "").strip()
+        if not line_text:
+            continue
+        if line_text.endswith(";") and "{" not in line_text:
+            names.add(name)
+    return names
+
+
+def _call_direction(candidate: CallCandidate) -> str:
+    normalized = str(candidate.normalized_name or "").strip().lower()
+    if any(fnmatchcase(normalized, pattern) for pattern in PAPER_FORWARD_API_PATTERNS):
         return "forward"
-    return str(default_direction or "backward").lower()
+    return "backward"
 
 
-def _build_line_scores_from_argument_slices(
+def _entry_arg_index(entry: Dict[str, Any]) -> int:
+    if "argIndex" in entry:
+        try:
+            return int(entry.get("argIndex"))
+        except Exception:
+            return -1
+    if "arg_index" in entry:
+        try:
+            return int(entry.get("arg_index"))
+        except Exception:
+            return -1
+    return -1
+
+
+def _forward_source_arg_indices(candidate: CallCandidate) -> List[int]:
+    normalized = str(candidate.normalized_name or "").strip().lower()
+    arg_count = int(len(candidate.arg_texts))
+    if arg_count <= 0:
+        return []
+    for pattern, indices in FORWARD_BUFFER_ARG_PATTERNS:
+        if fnmatchcase(normalized, pattern):
+            out = [idx for idx in indices if 1 <= int(idx) <= arg_count]
+            if out:
+                return out
+    if _forward_has_return_source(candidate):
+        return []
+    return list(range(1, arg_count + 1))
+
+
+def _forward_has_return_source(candidate: CallCandidate) -> bool:
+    normalized = str(candidate.normalized_name or "").strip().lower()
+    return any(fnmatchcase(normalized, pattern) for pattern in FORWARD_RETURN_SOURCE_PATTERNS)
+
+
+def _extract_assignment_lhs_identifiers(statement_text: str, call_name: str) -> List[str]:
+    text = str(statement_text or "")
+    raw_name = str(call_name or "")
+    if not text or not raw_name:
+        return []
+    if raw_name not in text:
+        return []
+    prefix = text.split(raw_name, 1)[0]
+    if "=" not in prefix:
+        return []
+    lhs = prefix.rsplit("=", 1)[0]
+    idents = _extract_identifiers(lhs)
+    if not idents:
+        return []
+    return [idents[-1]]
+
+
+def _summarize_arg_flow_rows(rows: Sequence[Dict[str, Any]], *, direction: str) -> Dict[str, Any]:
+    return {
+        "direction": str(direction),
+        "flow_row_count": int(len(rows)),
+        "path_count": int(sum(int(row.get("pathCount", 0)) for row in rows if isinstance(row, dict))),
+    }
+
+
+def _arg_flow_group_summary(entry: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "arg_code": str(entry.get("argCode") or entry.get("arg_code") or ""),
+        "arg_index": _entry_arg_index(entry),
+        "caller_method": str(entry.get("callerMethodName") or entry.get("caller_method") or ""),
+        "line_sequences": [
+            [int(line_no) for line_no in sequence if int(line_no) > 0]
+            for sequence in (entry.get("lineSequences") or entry.get("line_sequences") or [])
+            if isinstance(sequence, list)
+        ],
+        "direction": str(entry.get("direction") or ""),
+    }
+
+
+def _call_key(candidate: CallCandidate) -> Tuple[str, int, str]:
+    return (
+        str(candidate.caller_method_name or ""),
+        int(candidate.line_number),
+        str(candidate.raw_name or ""),
+    )
+
+
+def _flow_row_call_key(entry: Dict[str, Any]) -> Tuple[str, int, str]:
+    return (
+        str(entry.get("callerMethodName") or entry.get("caller_method") or ""),
+        int(entry.get("line") or entry.get("call_line") or -1),
+        str(entry.get("name") or entry.get("call_name") or entry.get("arg_code") or ""),
+    )
+
+
+def _match_argument_flow_rows(
+    flow_rows: Sequence[Dict[str, Any]],
+    *,
+    candidate: CallCandidate,
+    arg_index: int,
+) -> List[Dict[str, Any]]:
+    wanted_key = _call_key(candidate)
+    matches: List[Dict[str, Any]] = []
+    seen = set()
+    for entry in flow_rows:
+        if not isinstance(entry, dict):
+            continue
+        if _flow_row_call_key(entry) != wanted_key:
+            continue
+        if _entry_arg_index(entry) != int(arg_index):
+            continue
+        key = (
+            _flow_row_call_key(entry),
+            _entry_arg_index(entry),
+            tuple(
+                tuple(int(line_no) for line_no in seq if int(line_no) > 0)
+                for seq in (entry.get("lineSequences") or entry.get("line_sequences") or [])
+                if isinstance(seq, list)
+            ),
+        )
+        if key in seen:
+            continue
+        seen.add(key)
+        matches.append(entry)
+    return matches
+
+
+def _line_numbers_from_flow_rows(
     *,
     call_line: int,
-    matched_slices: Sequence[Dict[str, Any]],
-) -> Dict[int, float]:
-    scores: Dict[int, float] = {}
-    for entry in matched_slices:
-        for line_no, score in (entry.get("line_scores") or {}).items():
-            key = int(line_no)
-            scores[key] = float(scores.get(key, 0.0)) + float(score)
-    scores[int(call_line)] = float(scores.get(int(call_line), 0.0)) + 1.0
-    return {int(line_no): float(score) for line_no, score in sorted(scores.items()) if float(score) > 0.0}
+    flow_rows: Sequence[Dict[str, Any]],
+) -> List[int]:
+    line_numbers = {int(call_line)}
+    for entry in flow_rows:
+        for sequence in (entry.get("lineSequences") or entry.get("line_sequences") or []):
+            if not isinstance(sequence, list):
+                continue
+            for line_no in sequence:
+                parsed = int(line_no)
+                if parsed > 0:
+                    line_numbers.add(parsed)
+    return sorted(line_numbers)
 
 
-def _slice_matches_argument(entry: Dict[str, Any], *, call_line: int, arg_identifiers: Sequence[str]) -> bool:
-    if int(call_line) not in {int(x) for x in (entry.get("slice_lines") or []) if int(x) > 0}:
-        return False
-    if not arg_identifiers:
-        return False
-    variable_name = _normalize_identifier(str(entry.get("variable_name") or ""))
-    if not variable_name:
-        return False
-    wanted = {_normalize_identifier(name) for name in arg_identifiers}
-    return variable_name in wanted
+def _has_nonempty_line_sequences(flow_rows: Sequence[Dict[str, Any]]) -> bool:
+    for entry in flow_rows:
+        if not isinstance(entry, dict):
+            continue
+        for sequence in (entry.get("lineSequences") or entry.get("line_sequences") or []):
+            if not isinstance(sequence, list):
+                continue
+            if any(int(line_no) > 0 for line_no in sequence):
+                return True
+    return False
 
 
-def _summarize_slice_payload(payload: Dict[str, Any]) -> Dict[str, Any]:
-    return {
-        "direction": payload.get("direction"),
-        "num_graph_nodes": int(payload.get("num_graph_nodes", 0)),
-        "num_graph_edges": int(payload.get("num_graph_edges", 0)),
-        "num_variable_slices": int(payload.get("num_variable_slices", 0)),
-        "num_selected_variable_slices": int(payload.get("num_selected_variable_slices", 0)),
-        "meta": dict(payload.get("meta") or {}),
-    }
+def _compact_line_sequence(values: Sequence[int]) -> List[int]:
+    out: List[int] = []
+    for value in values:
+        parsed = int(value)
+        if parsed <= 0:
+            continue
+        if out and out[-1] == parsed:
+            continue
+        out.append(parsed)
+    return out
+
+
+def _extract_graph_argument_flow_groups(
+    graph_payload: Dict[str, Any],
+    *,
+    candidate: CallCandidate,
+    arg_index: int,
+    arg_text: str,
+    arg_identifiers: Sequence[str],
+    max_hops: Optional[int],
+    direction: str,
+) -> List[Dict[str, Any]]:
+    graph = dict(graph_payload.get("graph") or {})
+    nodes = [dict(item) for item in (graph.get("nodes") or []) if isinstance(item, dict)]
+    edges = [dict(item) for item in (graph.get("edges") or []) if isinstance(item, dict)]
+    wanted = {_normalize_identifier(name) for name in arg_identifiers if _normalize_identifier(name)}
+    if not wanted:
+        return []
+
+    node_map = {int(node.get("id")): node for node in nodes if int(node.get("id") or -1) >= 0}
+    out_edges: Dict[int, List[int]] = defaultdict(list)
+    in_edges: Dict[int, List[int]] = defaultdict(list)
+    for edge in edges:
+        if str(edge.get("label") or "") != GRAPH_FLOW_LABEL:
+            continue
+        src = int(edge.get("src") or -1)
+        dst = int(edge.get("dst") or -1)
+        if src < 0 or dst < 0:
+            continue
+        out_edges[src].append(dst)
+        in_edges[dst].append(src)
+
+    anchor_ids: List[int] = []
+    for node in nodes:
+        node_id = int(node.get("id") or -1)
+        if node_id < 0:
+            continue
+        if str(node.get("label") or "") not in GRAPH_VARIABLE_LABELS:
+            continue
+        if str(node.get("parentMethod") or "") != str(candidate.caller_method_name or ""):
+            continue
+        if int(node.get("lineNumber") or -1) != int(candidate.line_number):
+            continue
+        if _normalize_identifier(str(node.get("name") or "")) not in wanted:
+            continue
+        anchor_ids.append(node_id)
+    if not anchor_ids:
+        return []
+
+    hop_limit = None if max_hops is None else max(0, int(max_hops))
+    collected: List[List[int]] = []
+
+    def dfs(node_id: int, depth: int, path: List[int], seen: set[int], saw_downstream_match: bool) -> None:
+        node = node_map.get(int(node_id))
+        next_path = list(path)
+        next_saw_downstream_match = bool(saw_downstream_match or direction == "backward")
+        if node is not None:
+            line_no = int(node.get("lineNumber") or -1)
+            if line_no > 0:
+                next_path.append(line_no)
+            node_name = _normalize_identifier(str(node.get("name") or ""))
+            if depth > 0 and node_name in wanted:
+                next_saw_downstream_match = True
+        if hop_limit is not None and depth >= hop_limit:
+            base_sequence = [int(candidate.line_number)] + next_path
+            compact = _compact_line_sequence(base_sequence if next_saw_downstream_match else [int(candidate.line_number)])
+            if compact:
+                collected.append(compact)
+            return
+        adjacency = out_edges if direction == "forward" else in_edges
+        next_nodes = [int(nxt) for nxt in adjacency.get(int(node_id), []) if int(nxt) not in seen]
+        if not next_nodes:
+            base_sequence = [int(candidate.line_number)] + next_path
+            if direction == "backward":
+                base_sequence = list(reversed(base_sequence))
+            compact = _compact_line_sequence(base_sequence if next_saw_downstream_match else [int(candidate.line_number)])
+            if compact:
+                collected.append(compact)
+            return
+        advanced = False
+        for nxt in next_nodes:
+            advanced = True
+            dfs(int(nxt), depth + 1, next_path, seen | {int(nxt)}, next_saw_downstream_match)
+        if not advanced:
+            base_sequence = [int(candidate.line_number)] + next_path
+            if direction == "backward":
+                base_sequence = list(reversed(base_sequence))
+            compact = _compact_line_sequence(base_sequence if next_saw_downstream_match else [int(candidate.line_number)])
+            if compact:
+                collected.append(compact)
+
+    for anchor_id in sorted(set(anchor_ids)):
+        dfs(int(anchor_id), 0, [], {int(anchor_id)}, False)
+
+    unique_sequences: List[List[int]] = []
+    seen_sequences = set()
+    for sequence in collected:
+        key = tuple(int(line_no) for line_no in sequence if int(line_no) > 0)
+        if not key or key in seen_sequences:
+            continue
+        seen_sequences.add(key)
+        unique_sequences.append(list(key))
+    if not unique_sequences:
+        return []
+    return [
+        {
+            "arg_code": str(arg_text or ""),
+            "arg_index": int(arg_index),
+            "caller_method": str(candidate.caller_method_name or ""),
+            "call_line": int(candidate.line_number),
+            "call_name": str(candidate.raw_name or ""),
+            "line_sequences": unique_sequences,
+            "direction": str(direction),
+            "pathCount": int(len(unique_sequences)),
+        }
+    ]
 
 
 def extract_code_gadget_payload(
     *,
     code_text: str,
+    project_name: Optional[str] = None,
+    commit_id: Optional[str] = None,
+    project_source_root: Optional[Path] = None,
+    project_cache_dir: Path = DEFAULT_PROJECT_CACHE_DIR,
+    project_repo_map_path: Optional[Path] = DEFAULT_PROJECT_REPO_MAP_PATH,
+    strict_project_context: bool = True,
     prompt_text: str = "",
-    direction: str = "backward",
     joern_cli_dir: Path = DEFAULT_JOERN_CLI_DIR,
     cache_dir: Path = DEFAULT_CACHE_DIR,
     joern_cache_dir: Path = DEFAULT_JOERN_CACHE_DIR,
     slice_depth: int = 20,
     parallelism: int = 1,
     timeout_sec: int = 180,
-    include_control: bool = False,
-    include_post_dominance: bool = False,
     max_hops: Optional[int] = None,
-    sink_filter: Optional[str] = None,
 ) -> Dict[str, Any]:
-    del sink_filter
-    del include_post_dominance
     cache_dir = Path(cache_dir)
     cache_dir.mkdir(parents=True, exist_ok=True)
     cache_path = cache_dir / (
         _cache_key(
             code_text=code_text,
-            default_direction=direction,
+            project_name=project_name,
+            commit_id=commit_id,
+            strict_project_context=bool(strict_project_context),
             max_hops=max_hops,
             slice_depth=slice_depth,
             parallelism=parallelism,
@@ -617,10 +1234,50 @@ def extract_code_gadget_payload(
     if cache_path.is_file():
         return json.loads(cache_path.read_text(encoding="utf-8"))
 
-    source_map = _source_lines(code_text)
-    statement_lookup = _statement_lookup_by_line(code_text)
-    joern_call_rows = extract_joern_call_rows(
-        code_text=str(code_text or ""),
+    project_context: Optional[ProjectContext] = None
+    if strict_project_context:
+        if not project_name or not commit_id:
+            raise RuntimeError("Strict project context requires both project_name and commit_id.")
+        project_context = _resolve_project_context(
+            code_text=code_text,
+            project_name=project_name,
+            commit_id=commit_id,
+            project_source_root=project_source_root,
+            project_cache_dir=Path(project_cache_dir),
+            project_repo_map_path=project_repo_map_path,
+            timeout_sec=max(1, int(timeout_sec)),
+        )
+        analysis_code = project_context.source_text
+        analysis_source_path = project_context.source_path
+        target_start_line = int(project_context.snippet_start_line)
+        target_end_line = int(project_context.snippet_end_line)
+    else:
+        analysis_code = str(code_text or "")
+        analysis_source_path = None
+        target_start_line = 1
+        target_end_line = max(1, len(str(code_text or "").splitlines()))
+
+    source_map = _source_lines(analysis_code)
+    statement_lookup = _statement_lookup_by_line(analysis_code)
+
+    source_errors: Dict[str, str] = {}
+    raw_call_rows = extract_joern_call_rows(
+        code_text=analysis_code,
+        source_path=analysis_source_path,
+        prompt_text=str(prompt_text or ""),
+        joern_cli_dir=Path(joern_cli_dir),
+        timeout_sec=max(1, int(timeout_sec)),
+    )
+    raw_method_rows = extract_joern_method_rows(
+        code_text=analysis_code,
+        source_path=analysis_source_path,
+        prompt_text=str(prompt_text or ""),
+        joern_cli_dir=Path(joern_cli_dir),
+        timeout_sec=max(1, int(timeout_sec)),
+    )
+    raw_symbol_rows = extract_joern_user_symbol_rows(
+        code_text=analysis_code,
+        source_path=analysis_source_path,
         prompt_text=str(prompt_text or ""),
         joern_cli_dir=Path(joern_cli_dir),
         timeout_sec=max(1, int(timeout_sec)),
@@ -629,88 +1286,189 @@ def extract_code_gadget_payload(
         candidate
         for candidate in (
             _call_candidate_from_joern_row(row, statement_lookup=statement_lookup)
-            for row in joern_call_rows
+            for row in raw_call_rows
             if isinstance(row, dict)
         )
         if candidate is not None
     ]
-    call_candidates = _select_api_call_candidates(all_calls)
-    function_scopes = _collect_function_scopes(code_text)
+    function_scopes = _function_scopes_from_joern_rows(raw_method_rows)
+    declaration_only_targets = _declaration_only_method_names(
+        raw_method_rows,
+        source_map=source_map,
+    )
+    call_candidates = _select_api_call_candidates(
+        all_calls,
+        declaration_only_targets=declaration_only_targets,
+    )
     line_to_function = _line_to_function_map(function_scopes)
     user_defined_functions = [scope.name for scope in function_scopes]
+    user_symbols = _user_symbols_from_joern_rows(raw_symbol_rows)
+    user_defined_variable_names = sorted({symbol.name for symbol in user_symbols})
     function_call_graph = _build_function_call_graph(
         all_calls,
         user_defined_functions=user_defined_functions,
     )
-    directions_needed = sorted({_call_direction(candidate, default_direction=direction) for candidate in call_candidates} or {str(direction or "backward").lower()})
+    directions_needed = sorted({_call_direction(candidate) for candidate in call_candidates} or {"backward"})
 
-    payloads_by_direction: Dict[str, Dict[str, Any]] = {}
-    joern_errors: Dict[str, str] = {}
+    flow_rows_by_direction: Dict[str, List[Dict[str, Any]]] = {}
+    flow_graph_payload: Optional[Dict[str, Any]] = None
     for active_direction in directions_needed:
         try:
-            payloads_by_direction[active_direction] = extract_joern_variable_slices(
-                code_text=str(code_text or ""),
+            flow_rows_by_direction[active_direction] = extract_joern_external_call_argument_flows(
+                code_text=analysis_code,
+                source_path=analysis_source_path,
                 prompt_text=str(prompt_text or ""),
                 direction=active_direction,
+                joern_cli_dir=Path(joern_cli_dir),
+                cache_dir=Path(joern_cache_dir),
+                timeout_sec=max(1, int(timeout_sec)),
+            )
+        except Exception as exc:
+            source_errors[active_direction] = str(exc)
+    if "forward" in directions_needed:
+        try:
+            flow_graph_payload = generate_joern_slice_graph(
+                code_text=analysis_code,
+                source_path=analysis_source_path,
+                prompt_text=str(prompt_text or ""),
                 joern_cli_dir=Path(joern_cli_dir),
                 cache_dir=Path(joern_cache_dir),
                 slice_depth=max(1, int(slice_depth)),
                 parallelism=max(1, int(parallelism)),
                 timeout_sec=max(1, int(timeout_sec)),
-                include_control=bool(include_control),
-                include_post_dominance=False,
-                max_hops=None if max_hops is None else max(0, int(max_hops)),
-                sink_filter=None,
                 allow_empty=True,
             )
         except Exception as exc:
-            joern_errors[active_direction] = str(exc)
+            source_errors["forward_argument_flows"] = str(exc)
 
     code_gadgets: List[Dict[str, Any]] = []
     for gadget_index, candidate in enumerate(call_candidates):
-        active_direction = _call_direction(candidate, default_direction=direction)
-        slice_payload = payloads_by_direction.get(active_direction, {})
-        variable_slices = list(slice_payload.get("variable_slices") or [])
+        active_direction = _call_direction(candidate)
+        flow_rows = flow_rows_by_direction.get(active_direction, [])
+        active_forward_args = set(_forward_source_arg_indices(candidate)) if active_direction == "forward" else set()
+        return_source_identifiers = (
+            _extract_assignment_lhs_identifiers(candidate.statement_text, candidate.raw_name)
+            if active_direction == "forward" and _forward_has_return_source(candidate)
+            else []
+        )
 
-        matched_entries: List[Dict[str, Any]] = []
+        matched_rows: List[Dict[str, Any]] = []
         matched_global_keys = set()
-        argument_slice_counts: List[int] = []
-        for arg_idents in candidate.arg_identifiers:
-            matches: List[Dict[str, Any]] = []
-            seen = set()
-            for entry in variable_slices:
-                if not isinstance(entry, dict):
-                    continue
-                if not _slice_matches_argument(entry, call_line=candidate.line_number, arg_identifiers=arg_idents):
-                    continue
-                key = (
-                    str(entry.get("variable_key") or ""),
-                    tuple(int(x) for x in (entry.get("anchor_lines") or []) if int(x) > 0),
+        argument_slices: List[Dict[str, Any]] = []
+        for arg_index, arg_idents in enumerate(candidate.arg_identifiers):
+            source_arg_enabled = (arg_index + 1) in active_forward_args if active_direction == "forward" else True
+            matches = _match_argument_flow_rows(
+                flow_rows,
+                candidate=candidate,
+                arg_index=arg_index + 1,
+            ) if source_arg_enabled else []
+            if (
+                active_direction == "forward"
+                and source_arg_enabled
+                and flow_graph_payload is not None
+                and not _has_nonempty_line_sequences(matches)
+            ):
+                matches = _extract_graph_argument_flow_groups(
+                    flow_graph_payload,
+                    candidate=candidate,
+                    arg_index=arg_index + 1,
+                    arg_text=candidate.arg_texts[arg_index] if arg_index < len(candidate.arg_texts) else "",
+                    arg_identifiers=arg_idents,
+                    max_hops=max_hops,
+                    direction="forward",
                 )
-                if key in seen:
-                    continue
-                seen.add(key)
-                matches.append(entry)
-            argument_slice_counts.append(int(len(matches)))
+            if matches:
+                arg_line_numbers = _line_numbers_from_flow_rows(
+                    call_line=candidate.line_number,
+                    flow_rows=matches,
+                )
+                arg_line_sequence, _ = _assemble_code_gadget(
+                    line_numbers=arg_line_numbers,
+                    source_map=source_map,
+                    line_to_function=line_to_function,
+                    function_call_graph=function_call_graph,
+                    seed=int(hashlib.sha256(f"{candidate.raw_name}:{candidate.line_number}:{','.join(arg_idents)}".encode("utf-8")).hexdigest()[:8], 16),
+                )
+            else:
+                arg_line_sequence = [int(candidate.line_number)]
+            argument_slices.append(
+                {
+                    "arg_text": candidate.arg_texts[arg_index] if arg_index < len(candidate.arg_texts) else "",
+                    "arg_identifiers": list(arg_idents),
+                    "line_sequence": arg_line_sequence,
+                    "flow_count": int(sum(int(entry.get("pathCount", 0)) for entry in matches)),
+                    "flow_groups": [_arg_flow_group_summary(entry) for entry in matches],
+                }
+            )
             for entry in matches:
                 key = (
-                    str(entry.get("variable_key") or ""),
-                    tuple(int(x) for x in (entry.get("anchor_lines") or []) if int(x) > 0),
+                    _flow_row_call_key(entry),
+                    _entry_arg_index(entry),
+                    tuple(
+                        tuple(int(line_no) for line_no in seq if int(line_no) > 0)
+                        for seq in (entry.get("lineSequences") or entry.get("line_sequences") or [])
+                        if isinstance(seq, list)
+                    ),
                 )
                 if key in matched_global_keys:
                     continue
                 matched_global_keys.add(key)
-                matched_entries.append(entry)
+                matched_rows.append(entry)
 
-        if not matched_entries:
+        if active_direction == "forward" and return_source_identifiers and flow_graph_payload is not None:
+            return_matches = _extract_graph_argument_flow_groups(
+                flow_graph_payload,
+                candidate=candidate,
+                arg_index=0,
+                arg_text="<return>",
+                arg_identifiers=return_source_identifiers,
+                max_hops=max_hops,
+                direction="forward",
+            )
+            argument_slices.append(
+                {
+                    "arg_text": "<return>",
+                    "arg_identifiers": list(return_source_identifiers),
+                    "line_sequence": _assemble_code_gadget(
+                        line_numbers=_line_numbers_from_flow_rows(
+                            call_line=candidate.line_number,
+                            flow_rows=return_matches,
+                        ),
+                        source_map=source_map,
+                        line_to_function=line_to_function,
+                        function_call_graph=function_call_graph,
+                        seed=int(hashlib.sha256(f"{candidate.raw_name}:{candidate.line_number}:return".encode("utf-8")).hexdigest()[:8], 16),
+                    )[0]
+                    if return_matches
+                    else [int(candidate.line_number)],
+                    "flow_count": int(sum(int(entry.get("pathCount", 0)) for entry in return_matches)),
+                    "flow_groups": [_arg_flow_group_summary(entry) for entry in return_matches],
+                }
+            )
+            for entry in return_matches:
+                key = (
+                    _flow_row_call_key(entry),
+                    _entry_arg_index(entry),
+                    tuple(
+                        tuple(int(line_no) for line_no in seq if int(line_no) > 0)
+                        for seq in (entry.get("lineSequences") or entry.get("line_sequences") or [])
+                        if isinstance(seq, list)
+                    ),
+                )
+                if key in matched_global_keys:
+                    continue
+                matched_global_keys.add(key)
+                matched_rows.append(entry)
+
+        if not matched_rows:
             continue
 
-        line_scores = _build_line_scores_from_argument_slices(
+        line_sequence_numbers = _line_numbers_from_flow_rows(
             call_line=candidate.line_number,
-            matched_slices=matched_entries,
+            flow_rows=matched_rows,
         )
         line_sequence, function_pieces = _assemble_code_gadget(
-            line_numbers=sorted(set(int(candidate.line_number) for _ in [0]) | {int(line_no) for line_no in line_scores.keys() if int(line_no) > 0}),
+            line_numbers=line_sequence_numbers,
             source_map=source_map,
             line_to_function=line_to_function,
             function_call_graph=function_call_graph,
@@ -722,7 +1480,12 @@ def extract_code_gadget_payload(
             source_map=source_map,
             user_defined_functions=user_defined_functions,
             api_call_names=[entry.normalized_name for entry in call_candidates],
+            user_defined_variable_names=user_defined_variable_names,
         )
+        if int(candidate.line_number) < target_start_line or int(candidate.line_number) > target_end_line:
+            continue
+
+        symbolic_tokens = _lexical_tokens(symbolic_code_gadget)
         code_gadgets.append(
             {
                 "gadget_index": int(gadget_index),
@@ -733,47 +1496,52 @@ def extract_code_gadget_payload(
                 "statement_text": candidate.statement_text,
                 "arg_texts": list(candidate.arg_texts),
                 "arg_identifiers": [list(names) for names in candidate.arg_identifiers],
-                "argument_slice_counts": argument_slice_counts,
-                "source_variable_slices": int(len(matched_entries)),
+                "argument_slices": argument_slices,
                 "line_sequence": line_sequence,
-                "line_scores": line_scores,
+                "snippet_span": {
+                    "start_line": int(target_start_line),
+                    "end_line": int(target_end_line),
+                },
                 "function_pieces": function_pieces,
+                "source_path": str(analysis_source_path) if analysis_source_path is not None else None,
                 "code_gadget": code_gadget_text,
                 "symbolic_code_gadget": symbolic_code_gadget,
+                "symbolic_tokens": symbolic_tokens,
+                "vectorization_policy": {
+                    "padding_side": "left" if active_direction == "backward" else "right",
+                    "truncation_side": "left" if active_direction == "backward" else "right",
+                },
                 "symbolic_mappings": symbolic_mappings,
             }
         )
 
     payload = {
-        "direction": "mixed",
-        "num_graph_nodes": int(max((payload.get("num_graph_nodes", 0) for payload in payloads_by_direction.values()), default=0)),
-        "num_graph_edges": int(max((payload.get("num_graph_edges", 0) for payload in payloads_by_direction.values()), default=0)),
-        "num_variable_slices": int(sum(int(payload.get("num_variable_slices", 0)) for payload in payloads_by_direction.values())),
-        "num_selected_variable_slices": int(sum(int(payload.get("num_selected_variable_slices", 0)) for payload in payloads_by_direction.values())),
-        "sink_filter": "",
-        "sink_node_ids": [],
-        "aggregate_line_scores": {},
-        "variable_slices": [],
         "code_gadgets": code_gadgets,
-        "selected_code_gadget": None,
         "meta": {
             "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
             "backend": "code_gadget",
-            "source_backend": "joern_slice",
+            "source_backend": "joern",
             "construction": "vuldeepecker",
-            "default_direction": str(direction or "backward").lower(),
-            "include_control": bool(include_control),
+            "strict_project_context": bool(strict_project_context),
             "symbolic_transform": True,
+            "call_classification": "vuldeepecker_api_keypoints",
+            "graph_stats": {
+                "direction_summaries": {
+                    active_direction: _summarize_arg_flow_rows(rows, direction=active_direction)
+                    for active_direction, rows in flow_rows_by_direction.items()
+                },
+            },
             "gadget_count": int(len(code_gadgets)),
-            "call_count": int(len(call_candidates)),
             "api_call_count": int(len(call_candidates)),
             "all_call_count": int(len(all_calls)),
             "function_scope_count": int(len(function_scopes)),
-            "joern_errors": dict(joern_errors),
-            "per_direction_summaries": {
-                active_direction: _summarize_slice_payload(payload)
-                for active_direction, payload in payloads_by_direction.items()
-            },
+            "user_symbol_count": int(len(user_symbols)),
+            "project_name": str(project_name or ""),
+            "commit_id": str(commit_id or ""),
+            "analysis_source_path": str(analysis_source_path) if analysis_source_path is not None else None,
+            "target_start_line": int(target_start_line),
+            "target_end_line": int(target_end_line),
+            "source_errors": dict(source_errors),
             "slice_empty": len(code_gadgets) == 0,
             "empty_reason": None if code_gadgets else "no-api-call-gadgets",
         },

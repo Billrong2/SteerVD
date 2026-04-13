@@ -2,7 +2,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import csv
 import json
 import os
@@ -24,10 +23,6 @@ PROJECT_ROOT = Path(__file__).resolve().parent
 
 from models import ModelRunner
 from paths import model_dir_name, resolve_artifact_path
-from steering import SteeringConfig
-
-
-DEFAULT_JOERN_CLI_DIR = Path.home() / "bin" / "joern" / "joern-cli"
 DEFAULT_LOCAL_OUTPUT_DIR = Path("primevul")
 DEFAULT_CODE_FIELDS = "func_before,func,code"
 DEFAULT_LABEL_FIELDS = "target,vul,label"
@@ -336,330 +331,6 @@ def _default_run_name() -> str:
     return time.strftime("%Y%m%d-%H%M%S")
 
 
-def _variant_list(args: argparse.Namespace) -> List[str]:
-    variant = str(args.variant).lower()
-    if variant == "both":
-        return ["baseline", "steered"]
-    return [variant]
-
-
-def _build_steering_config(args: argparse.Namespace, project_root: Path) -> Optional[SteeringConfig]:
-    if not bool(args.steer):
-        return None
-
-    joern_cache_dir = resolve_artifact_path(project_root, args.joern_cache_dir)
-    head_mask_path = (
-        resolve_artifact_path(project_root, args.head_mask_path)
-        if args.head_mask_path is not None
-        else None
-    )
-    head_subset_auto_save = (
-        resolve_artifact_path(project_root, args.head_subset_auto_save)
-        if args.head_subset_auto_save is not None
-        else None
-    )
-    return SteeringConfig(
-        enabled_levels=[2],
-        prior=args.prior,
-        n_bins=max(1, int(args.n_bins)),
-        binning="equal_count",
-        beta_bias=float(args.beta_bias),
-        beta_post=float(args.beta_post),
-        lambda_attn=float(args.lambda_attn),
-        lambda_mlp=float(args.lambda_mlp),
-        alpha_k=float(args.alpha_k),
-        alpha_v=float(args.alpha_v),
-        bias_cap=None if args.bias_cap is None else float(args.bias_cap),
-        gamma_min=float(args.gamma_min),
-        gamma_max=float(args.gamma_max),
-        eta_min=float(args.eta_min),
-        eta_max=float(args.eta_max),
-        recency_mix=(args.recency_mix == "on"),
-        recency_rho=float(args.recency_rho),
-        recency_window=max(1, int(args.recency_window)),
-        recency_apply_after_prompt=(args.recency_apply_after_prompt == "on"),
-        recency_scope=str(args.recency_scope),
-        joern_cli_dir=args.joern_cli_dir,
-        joern_cache_dir=joern_cache_dir,
-        joern_direction=str(args.joern_direction),
-        joern_slice_depth=max(1, int(args.joern_slice_depth)),
-        joern_parallelism=max(1, int(args.joern_parallelism)),
-        joern_timeout_sec=max(1, int(args.joern_timeout_sec)),
-        joern_include_control=(args.joern_include_control == "on"),
-        joern_max_hops=args.joern_max_hops,
-        head_subset_mode=str(args.head_subset_mode),
-        head_mask_path=head_mask_path,
-        head_mask_apply_to=str(args.head_mask_apply_to),
-        head_mask_debug=bool(args.head_mask_debug),
-        head_subset_topk_per_layer=max(1, int(args.head_subset_topk_per_layer)),
-        head_subset_calib_runs=max(1, int(args.head_subset_calib_runs)),
-        head_subset_calib_max_new_tokens=max(1, int(args.head_subset_calib_max_new_tokens)),
-        head_subset_calib_first_decode_only=(args.head_subset_calib_first_decode_only == "on"),
-        head_subset_auto_save=head_subset_auto_save,
-        collect_head_stats=(args.collect_head_stats == "on"),
-        collect_head_stats_first_decode_only=(args.collect_head_stats_first_decode_only == "on"),
-    )
-
-
-def _apply_last_n_layers(model: ModelRunner, cfg: Optional[SteeringConfig], last_n: Optional[int]) -> None:
-    if cfg is None or last_n is None or model.model is None:
-        return
-    num_layers = int(getattr(getattr(model.model, "config", None), "num_hidden_layers", 0))
-    if num_layers <= 0:
-        return
-    n = max(1, min(int(last_n), num_layers))
-    cfg.steer_layer_start = max(0, num_layers - n)
-    cfg.steer_layer_end = max(0, num_layers - 1)
-
-
-def _extract_joern_summary(model: ModelRunner) -> Optional[Dict[str, Any]]:
-    runtime = getattr(model, "_steering_runtime", None) or getattr(model, "_last_steering_runtime", None)
-    manager = getattr(runtime, "manager", None)
-    prior = getattr(manager, "prior_provider", None)
-    payload = getattr(prior, "joern_payload", None)
-    if not isinstance(payload, dict):
-        return None
-
-    aggregate = payload.get("aggregate_line_scores") or {}
-    top_lines = sorted(
-        ((int(line_no), float(score)) for line_no, score in aggregate.items()),
-        key=lambda item: (-item[1], item[0]),
-    )[:12]
-    selected_code_gadget = payload.get("selected_code_gadget")
-    return {
-        "direction": payload.get("direction"),
-        "num_variable_slices": int(payload.get("num_variable_slices", 0)),
-        "num_selected_variable_slices": int(payload.get("num_selected_variable_slices", 0)),
-        "num_graph_nodes": int(payload.get("num_graph_nodes", 0)),
-        "num_graph_edges": int(payload.get("num_graph_edges", 0)),
-        "top_lines": top_lines,
-        "sink_filter": payload.get("sink_filter"),
-        "selected_code_gadget": dict(selected_code_gadget) if isinstance(selected_code_gadget, dict) else None,
-        "meta": dict(payload.get("meta") or {}),
-    }
-
-
-def _calibrate_head_subset_for_protocol(
-    *,
-    model: ModelRunner,
-    base_cfg: Optional[SteeringConfig],
-    code: str,
-    sample_id: str,
-    seed_base: int,
-    protocol: str,
-    instruction: Optional[str],
-    language: str,
-    answer_prefix: str,
-    temperature: float,
-    top_p: float,
-    top_k: Optional[int],
-) -> Dict[str, Any]:
-    if base_cfg is None:
-        return {"mode": "none", "active_total": 0, "layers_with_heads": 0}
-    if str(base_cfg.head_subset_mode).lower() != "auto":
-        return {"mode": str(base_cfg.head_subset_mode), "active_total": 0, "layers_with_heads": 0}
-    if not any(level in base_cfg.enabled_levels for level in (1, 2)):
-        raise RuntimeError("Head subset auto mode requires active attention steering.")
-
-    from steering.backends.common import compute_default_cutoffs
-
-    runs = max(1, int(base_cfg.head_subset_calib_runs))
-    calib_max_new = max(1, int(base_cfg.head_subset_calib_max_new_tokens))
-    topk = max(1, int(base_cfg.head_subset_topk_per_layer))
-
-    calib_cfg = copy.deepcopy(base_cfg)
-    calib_cfg.head_subset_mode = "none"
-    calib_cfg.head_mask_path = None
-    calib_cfg.head_mask_inline = None
-    calib_cfg.head_subset_selected_heads = {}
-    calib_cfg.head_subset_calibration = {}
-    calib_cfg.collect_head_stats = True
-    calib_cfg.collect_head_stats_first_decode_only = bool(base_cfg.head_subset_calib_first_decode_only)
-    calib_cfg.beta_bias = 0.0
-    calib_cfg.beta_post = 0.0
-    calib_cfg.schedule = {}
-
-    agg_sum: Optional[np.ndarray] = None
-    agg_count: Optional[np.ndarray] = None
-    valid_runs = 0
-
-    for run_idx in range(runs):
-        _seed_all(int(seed_base) + int(run_idx))
-        _set_active_steering(model, calib_cfg)
-        result = _run_generation(
-            model=model,
-            code=code,
-            protocol=protocol,
-            instruction=instruction,
-            language=language,
-            answer_prefix=answer_prefix,
-            max_new_tokens=calib_max_new,
-            temperature=float(temperature),
-            top_p=float(top_p),
-            top_k=top_k,
-            do_sample=True,
-        )
-        hs = (result.get("steering_debug") or {}).get("head_stats")
-        if not hs:
-            continue
-        run_sum = np.asarray(hs.get("sum", []), dtype=np.float64)
-        run_count = np.asarray(hs.get("count", []), dtype=np.float64)
-        if run_sum.ndim != 2 or run_count.ndim != 2:
-            continue
-        if agg_sum is None:
-            agg_sum = np.zeros_like(run_sum, dtype=np.float64)
-            agg_count = np.zeros_like(run_count, dtype=np.float64)
-        if agg_sum.shape != run_sum.shape:
-            raise RuntimeError(f"Head stats shape mismatch during calibration: {agg_sum.shape} vs {run_sum.shape}")
-        agg_sum += run_sum
-        agg_count += run_count
-        valid_runs += 1
-
-    if agg_sum is None or agg_count is None or valid_runs == 0:
-        raise RuntimeError("Step-4 auto calibration failed: no valid head stats collected.")
-
-    with np.errstate(divide="ignore", invalid="ignore"):
-        mean = np.divide(agg_sum, np.maximum(agg_count, 1.0), where=np.maximum(agg_count, 1.0) > 0)
-
-    num_layers, num_heads = mean.shape
-    cutoffs = compute_default_cutoffs(num_layers)
-    layer_start = cutoffs.l12_start if base_cfg.steer_layer_start is None else int(base_cfg.steer_layer_start)
-    layer_end = cutoffs.l12_end if base_cfg.steer_layer_end is None else int(base_cfg.steer_layer_end)
-    layer_start = max(0, min(num_layers - 1, layer_start))
-    layer_end = max(layer_start, min(num_layers - 1, layer_end))
-    k = max(1, min(topk, num_heads))
-
-    mask = np.zeros((num_layers, num_heads), dtype=bool)
-    active_heads: Dict[str, List[int]] = {}
-    for li in range(layer_start, layer_end + 1):
-        candidates = np.where(agg_count[li] > 0)[0]
-        if candidates.size == 0:
-            continue
-        scores = mean[li, candidates]
-        order = np.argsort(-scores)
-        selected = candidates[order[: min(k, candidates.size)]].astype(int).tolist()
-        if not selected:
-            continue
-        mask[li, selected] = True
-        active_heads[str(li)] = selected
-
-    active_total = int(mask.sum())
-    if active_total <= 0:
-        raise RuntimeError("Step-4 auto calibration selected zero heads; aborting.")
-
-    base_cfg.head_mask_inline = {
-        "meta": {
-            "model_name": model.model_name,
-            "mode": "auto",
-            "snippet": sample_id,
-        },
-        "mask": mask.astype(np.int32).tolist(),
-        "active_heads": active_heads,
-    }
-    base_cfg.head_subset_selected_heads = active_heads
-    base_cfg.head_subset_calibration = {
-        "mode": "auto",
-        "calib_runs_requested": int(runs),
-        "calib_runs_valid": int(valid_runs),
-        "calib_max_new_tokens": int(calib_max_new),
-        "collect_first_decode_only": bool(base_cfg.head_subset_calib_first_decode_only),
-        "layer_start": int(layer_start),
-        "layer_end": int(layer_end),
-        "topk_per_layer": int(k),
-        "active_total": int(active_total),
-        "layers_with_heads": int(len(active_heads)),
-        "auto_save_path": None,
-    }
-
-    if base_cfg.head_subset_auto_save:
-        save_path = model._resolve_auto_mask_save_path(
-            base_cfg.head_subset_auto_save,
-            snippet_name=sample_id,
-            topk=k,
-        )
-        payload = {
-            "meta": {
-                "snippet": sample_id,
-                "model_name": model.model_name,
-                "mode": "auto",
-                "calib_runs_requested": int(runs),
-                "calib_runs_valid": int(valid_runs),
-                "calib_max_new_tokens": int(calib_max_new),
-                "collect_first_decode_only": bool(base_cfg.head_subset_calib_first_decode_only),
-                "layer_start": int(layer_start),
-                "layer_end": int(layer_end),
-                "topk_per_layer": int(k),
-                "protocol": str(protocol),
-            },
-            "shape": [int(num_layers), int(num_heads)],
-            "mask": mask.astype(np.int32).tolist(),
-            "active_heads": active_heads,
-            "agree_mean": mean.tolist(),
-            "agree_sum": agg_sum.tolist(),
-            "agree_count": agg_count.astype(np.int64).tolist(),
-        }
-        save_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        base_cfg.head_subset_calibration["auto_save_path"] = str(save_path)
-        print(f"[HeadSubset-Auto] saved mask -> {save_path}")
-
-    noop_ok: Optional[bool] = None
-    beta_zero = abs(float(base_cfg.beta_bias)) <= 1e-12 and abs(float(base_cfg.beta_post)) <= 1e-12
-    if beta_zero:
-        cfg_none = copy.deepcopy(base_cfg)
-        cfg_none.head_subset_mode = "none"
-        cfg_none.head_mask_inline = None
-        cfg_none.collect_head_stats = False
-
-        cfg_auto = copy.deepcopy(base_cfg)
-        cfg_auto.head_subset_mode = "auto"
-        cfg_auto.collect_head_stats = False
-
-        compare_seed = int(seed_base) + 10_000
-        _seed_all(compare_seed)
-        _set_active_steering(model, cfg_none)
-        out_none = _run_generation(
-            model=model,
-            code=code,
-            protocol=protocol,
-            instruction=instruction,
-            language=language,
-            answer_prefix=answer_prefix,
-            max_new_tokens=min(calib_max_new, 16),
-            temperature=float(temperature),
-            top_p=float(top_p),
-            top_k=top_k,
-            do_sample=False,
-        )
-
-        _seed_all(compare_seed)
-        _set_active_steering(model, cfg_auto)
-        out_auto = _run_generation(
-            model=model,
-            code=code,
-            protocol=protocol,
-            instruction=instruction,
-            language=language,
-            answer_prefix=answer_prefix,
-            max_new_tokens=min(calib_max_new, 16),
-            temperature=float(temperature),
-            top_p=float(top_p),
-            top_k=top_k,
-            do_sample=False,
-        )
-        noop_ok = out_none.get("token_ids_all") == out_auto.get("token_ids_all")
-        if not noop_ok:
-            raise RuntimeError("Step-4 smoke check failed: auto head subset with beta=0 changed outputs.")
-        base_cfg.head_subset_calibration["beta_zero_noop_ok"] = bool(noop_ok)
-
-    return dict(base_cfg.head_subset_calibration)
-
-
-def _set_active_steering(model: ModelRunner, cfg: Optional[SteeringConfig]) -> None:
-    model.steering_config = copy.deepcopy(cfg) if cfg is not None else None
-    model._steering_runtime = None
-    model._last_steering_runtime = None
-
-
 def _run_generation(
     *,
     model: ModelRunner,
@@ -737,7 +408,6 @@ def _make_error_record(
         "elapsed_sec": round(time.perf_counter() - started, 4),
         "generated_completion": "",
         "steering_debug": None,
-        "joern_summary": None,
         "error_type": type(exc).__name__,
         "error_message": str(exc),
     }
@@ -870,7 +540,7 @@ def _preview_rows(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Run baseline vulnerability classification on PrimeVul-style datasets with future code_gadget steering hooks preserved."
+        description="Run baseline vulnerability classification on PrimeVul-style datasets."
     )
     source = parser.add_mutually_exclusive_group(required=True)
     source.add_argument("--dataset-path", type=Path, default=None, help="Local dataset file (.jsonl/.json/.csv/.parquet).")
@@ -894,7 +564,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=1234)
     parser.add_argument("--preview-only", action="store_true", help="Load records and print a few formatted examples without running a model.")
     parser.add_argument("--preview-count", type=int, default=3)
-    parser.add_argument("--variant", choices=["baseline", "steered", "both"], default="baseline")
+    parser.add_argument("--variant", choices=["baseline"], default="baseline")
     parser.add_argument("--instruction", type=str, default=None, help="Optional custom instruction. If omitted, selected by --protocol.")
     parser.add_argument("--answer-prefix", type=str, default="\n")
     parser.add_argument("--model-name", type=str, default=None, help="HF model name. Defaults to ModelRunner's built-in default.")
@@ -911,49 +581,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_LOCAL_OUTPUT_DIR)
     parser.add_argument("--run-name", type=str, default=None)
 
-    parser.add_argument("--steer", action="store_true", help="Enable steering for the steered variant.")
-    parser.add_argument(
-        "--prior",
-        choices=["code_gadget"],
-        default="code_gadget",
-    )
-    parser.add_argument("--n-bins", type=int, default=8)
-    parser.add_argument("--beta-bias", type=float, default=0.0)
-    parser.add_argument("--beta-post", type=float, default=0.0)
-    parser.add_argument("--lambda-attn", type=float, default=1.0)
-    parser.add_argument("--lambda-mlp", type=float, default=1.0)
-    parser.add_argument("--alpha-k", type=float, default=0.0)
-    parser.add_argument("--alpha-v", type=float, default=0.0)
-    parser.add_argument("--bias-cap", type=float, default=None)
-    parser.add_argument("--gamma-min", type=float, default=0.0)
-    parser.add_argument("--gamma-max", type=float, default=5.0)
-    parser.add_argument("--eta-min", type=float, default=0.0)
-    parser.add_argument("--eta-max", type=float, default=5.0)
-    parser.add_argument("--recency-mix", choices=["on", "off"], default="on")
-    parser.add_argument("--recency-rho", type=float, default=0.2)
-    parser.add_argument("--recency-window", type=int, default=64)
-    parser.add_argument("--recency-apply-after-prompt", choices=["on", "off"], default="on")
-    parser.add_argument("--recency-scope", choices=["prefer_generated", "last_w"], default="prefer_generated")
-    parser.add_argument("--steer-last-n-layers", type=int, default=None)
-    parser.add_argument("--head-subset-mode", choices=["none", "file", "auto"], default="none")
-    parser.add_argument("--head-mask-path", type=Path, default=None)
-    parser.add_argument("--head-mask-apply-to", choices=["l1", "l2", "both"], default="both")
-    parser.add_argument("--head-mask-debug", action="store_true")
-    parser.add_argument("--head-subset-topk-per-layer", type=int, default=4)
-    parser.add_argument("--head-subset-calib-runs", type=int, default=3)
-    parser.add_argument("--head-subset-calib-max-new-tokens", type=int, default=64)
-    parser.add_argument("--head-subset-calib-first-decode-only", choices=["on", "off"], default="on")
-    parser.add_argument("--head-subset-auto-save", type=Path, default=None)
-    parser.add_argument("--collect-head-stats", choices=["on", "off"], default="off")
-    parser.add_argument("--collect-head-stats-first-decode-only", choices=["on", "off"], default="on")
-    parser.add_argument("--joern-cli-dir", type=Path, default=DEFAULT_JOERN_CLI_DIR)
-    parser.add_argument("--joern-cache-dir", type=Path, default=Path(".cache/joern_slice"))
-    parser.add_argument("--joern-direction", choices=["backward", "forward"], default="backward")
-    parser.add_argument("--joern-slice-depth", type=int, default=20)
-    parser.add_argument("--joern-parallelism", type=int, default=1)
-    parser.add_argument("--joern-timeout-sec", type=int, default=180)
-    parser.add_argument("--joern-include-control", choices=["on", "off"], default="on")
-    parser.add_argument("--joern-max-hops", type=int, default=None)
     parser.add_argument("--resume", choices=["on", "off"], default="off")
     parser.add_argument("--checkpoint-every", type=int, default=50)
     return parser.parse_args()
@@ -962,13 +589,6 @@ def parse_args() -> argparse.Namespace:
 def main() -> int:
     args = parse_args()
     args.protocol = _normalize_protocol(args.protocol)
-    if args.variant in {"steered", "both"} and not args.steer:
-        args.steer = True
-    if args.steer and args.prior == "code_gadget":
-        raise ValueError(
-            "Steered code_gadget runs are temporarily blocked pending the final "
-            "multi-gadget-to-prior reduction rule."
-        )
     samples_per_snippet = max(1, int(args.samples_per_snippet))
 
     code_fields = _parse_csv_fields(args.code_field)
@@ -1014,8 +634,7 @@ def main() -> int:
     elif args.gpus is not None and visible_gpus > 0:
         max_devices = min(max(1, int(args.gpus)), visible_gpus)
 
-    variants = _variant_list(args)
-    base_steering_cfg = _build_steering_config(args, PROJECT_ROOT)
+    variants = ["baseline"]
 
     try:
         model.login_hf()
@@ -1031,12 +650,7 @@ def main() -> int:
         top_k=args.top_k,
         max_devices=max_devices,
     )
-    if "steered" in variants and base_steering_cfg is not None:
-        _apply_last_n_layers(model, base_steering_cfg, args.steer_last_n_layers)
-        model.set_steering_config(copy.deepcopy(base_steering_cfg))
     model.build()
-    if "steered" in variants and base_steering_cfg is not None:
-        _apply_last_n_layers(model, base_steering_cfg, args.steer_last_n_layers)
 
     run_manifest = {
         "created_at": time.strftime("%Y-%m-%dT%H:%M:%S"),
@@ -1052,19 +666,9 @@ def main() -> int:
         "protocol": args.protocol,
         "instruction": selected_instruction or _default_instruction_for_protocol(args.protocol),
         "samples_per_snippet": int(samples_per_snippet),
-        "variant": args.variant,
+        "variant": "baseline",
         "variants": variants,
         "model_name": model.model_name,
-        "steering_enabled": bool(args.steer),
-        "prior": args.prior,
-        "joern_direction": args.joern_direction,
-        "joern_slice_depth": int(args.joern_slice_depth),
-        "joern_timeout_sec": int(args.joern_timeout_sec),
-        "steer_last_n_layers": args.steer_last_n_layers,
-        "head_subset_mode": args.head_subset_mode,
-        "head_subset_topk_per_layer": int(args.head_subset_topk_per_layer),
-        "head_subset_calib_runs": int(args.head_subset_calib_runs),
-        "head_subset_calib_max_new_tokens": int(args.head_subset_calib_max_new_tokens),
     }
     predictions_path = output_root / "predictions.jsonl"
     if args.resume == "on":
@@ -1103,29 +707,10 @@ def main() -> int:
                     ]
                     if not needed_runs:
                         continue
-                    variant_cfg = copy.deepcopy(base_steering_cfg) if (variant == "steered" and base_steering_cfg is not None) else None
                     pending_runs = list(needed_runs)
                     try:
-                        if variant == "steered" and variant_cfg is not None and str(variant_cfg.head_subset_mode).lower() == "auto":
-                            _calibrate_head_subset_for_protocol(
-                                model=model,
-                                base_cfg=variant_cfg,
-                                code=code,
-                                sample_id=sample_id,
-                                seed_base=int(args.seed) + int(row_idx) * 1000 + 500_000,
-                                protocol=args.protocol,
-                                instruction=selected_instruction,
-                                language=args.language,
-                                answer_prefix=args.answer_prefix,
-                                temperature=float(args.temperature),
-                                top_p=float(args.top_p),
-                                top_k=args.top_k,
-                            )
                         for sample_run in needed_runs:
-                            _set_active_steering(model, variant_cfg)
                             sample_seed = int(args.seed) + int(row_idx) * 1000 + sample_run
-                            if variant == "steered":
-                                sample_seed += 1_000_000
                             _seed_all(sample_seed)
                             started = time.perf_counter()
                             result = _run_generation(
@@ -1143,7 +728,6 @@ def main() -> int:
                             )
                             completion = str(result.get("generated_completion", "") or "")
                             pred_label = _parse_prediction_label(completion)
-                            joern_summary = _extract_joern_summary(model) if variant == "steered" else None
                             result["elapsed_sec"] = round(time.perf_counter() - started, 4)
                             record = {
                                 "sample_index": int(row_idx),
@@ -1157,7 +741,6 @@ def main() -> int:
                                 "elapsed_sec": float(result.get("elapsed_sec", 0.0)),
                                 "generated_completion": completion,
                                 "steering_debug": result.get("steering_debug"),
-                                "joern_summary": joern_summary,
                             }
                             per_variant[variant].append(record)
                             completed_records.add((int(row_idx), str(variant), int(sample_run)))
@@ -1182,8 +765,6 @@ def main() -> int:
                         _recover_from_cuda_oom(model)
                         for sample_run in pending_runs:
                             sample_seed = int(args.seed) + int(row_idx) * 1000 + sample_run
-                            if variant == "steered":
-                                sample_seed += 1_000_000
                             error_record = _make_error_record(
                                 row_idx=row_idx,
                                 sample_id=sample_id,

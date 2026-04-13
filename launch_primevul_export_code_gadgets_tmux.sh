@@ -2,15 +2,16 @@
 set -euo pipefail
 
 ROOT="/home/cs/x/xxr230000/Steer_VD"
-MODEL_DIR="Qwen_Qwen2.5-Coder-7B-Instruct"
-RUN_NAME="${1:-qwen25_primevul_full_baseline_revdcot}"
-OUT_DIR="${ROOT}/artifacts/primevul/${MODEL_DIR}/${RUN_NAME}"
-LOG_PATH="${OUT_DIR}.log"
-PID_PATH="${OUT_DIR}.pid"
-RUNNER_PATH="${OUT_DIR}.runner.sh"
-SESSION_NAME="primevul_${RUN_NAME//[^A-Za-z0-9_]/_}"
+OUTPUT_ROOT="${1:-${ROOT}/Source/primevul_test_snippets}"
+STRICT_MODE="${2:-off}"
+TARGET_FILTER="${3:-all}"
+SESSION_BASE="$(basename "${OUTPUT_ROOT}")"
+SESSION_NAME="primevul_export_${SESSION_BASE//[^A-Za-z0-9_]/_}"
+LOG_PATH="${OUTPUT_ROOT}.log"
+PID_PATH="${OUTPUT_ROOT}.pid"
+RUNNER_PATH="${OUTPUT_ROOT}.runner.sh"
 
-mkdir -p "$(dirname "${OUT_DIR}")"
+mkdir -p "$(dirname "${OUTPUT_ROOT}")"
 
 cd "${ROOT}"
 
@@ -18,24 +19,22 @@ CMD_STR=$(cat <<EOF
 cd "${ROOT}" && \
 export TOKENIZERS_PARALLELISM=false && \
 export PYTHONUNBUFFERED=1 && \
-exec python3 "${ROOT}/primevul_eval.py" \
+export JAVA_HOME="/usr" && \
+export PATH="/usr/bin:\$PATH" && \
+exec python3 "${ROOT}/primevul_export_code_gadgets.py" \
   --dataset-path "${ROOT}/Source/primevul_test.jsonl" \
-  --protocol revd_cot \
-  --variant baseline \
-  --model-name Qwen/Qwen2.5-Coder-7B-Instruct \
-  --cache-dir /home/cs/x/xxr230000/.cache/models \
-  --gpu-ids 0 \
-  --samples-per-snippet 1 \
-  --do-sample off \
-  --max-new-tokens 128 \
-  --language c \
-  --run-name "${RUN_NAME}" \
+  --output-root "${OUTPUT_ROOT}" \
+  --strict-project-context "${STRICT_MODE}" \
+  --target-filter "${TARGET_FILTER}" \
   --resume on \
   --checkpoint-every 25
 EOF
 )
 
-echo "Launching detached baseline run: ${RUN_NAME}"
+echo "Launching detached code-gadget export"
+echo "Output root: ${OUTPUT_ROOT}"
+echo "Strict project context: ${STRICT_MODE}"
+echo "Target filter: ${TARGET_FILTER}"
 echo "Log: ${LOG_PATH}"
 echo "PID file: ${PID_PATH}"
 echo "tmux session: ${SESSION_NAME}"
@@ -43,7 +42,7 @@ echo "tmux session: ${SESSION_NAME}"
 cat > "${RUNNER_PATH}" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
-${CMD_STR} > "${LOG_PATH}" 2>&1
+${CMD_STR} 2>&1 | tee "${LOG_PATH}"
 EOF
 chmod +x "${RUNNER_PATH}"
 

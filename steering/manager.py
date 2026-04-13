@@ -33,11 +33,9 @@ class SteeringManager:
             prior_kwargs.update(
                 joern_cli_dir=config.joern_cli_dir,
                 cache_dir=config.joern_cache_dir,
-                direction=config.joern_direction,
                 slice_depth=config.joern_slice_depth,
                 parallelism=config.joern_parallelism,
                 timeout_sec=config.joern_timeout_sec,
-                include_control=config.joern_include_control,
                 max_hops=config.joern_max_hops,
             )
         context = PriorContext(

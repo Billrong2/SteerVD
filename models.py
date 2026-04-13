@@ -4,8 +4,8 @@
 # with attention capture, pooled-attention summaries, and optional steering.
 #
 # Notes:
-# - Only HUGGINGFACE_TOKEN is read from the environment (optional).
-# - All other settings are hard-coded defaults; change them via llama.config(...).
+# - HUGGINGFACE_TOKEN and optional LLM_FORCE_4BIT may be read from the environment.
+# - All other settings are hard-coded defaults; change them via .config(...).
 # - Keep attn_implementation="eager" so attention tensors are exposed.
 # - 70B BF16 typically needs large VRAM (e.g., 4x80GB). Set use_4bit=True to experiment on smaller GPUs.
 # - Attention tensors scale ~O(L^2); long prompts or large max_new_tokens increase memory.
@@ -52,7 +52,6 @@ DEFAULT_TEMP       = 0.7
 DEFAULT_TOP_P      = 1.0
 DEFAULT_TOP_K      = 7
 DEFAULT_TOP_ATTN_K = 10
-DEFAULT_ATTN_DIR   = "attn_viz"
 DEFAULT_MEM_FRAC   = 0.90
 DEFAULT_KEY_SCOPE  = "prompt"   # "prompt" | "all"
 DEFAULT_RENORMAL   = True
@@ -89,14 +88,12 @@ class SteeredCausalLM:
             top_p=1.0,
             top_k=7,
             top_attended_k=10,
-            attn_dump_dir="attn_dumps",
             mem_fraction=0.90,
             key_scope="prompt",   # or "all"
             renormalize=True,
         )
         lm.build()
         result = lm.run_llama("def two_sum(...): ...", language="python")
-        lm.save_dump(result, "attn_dumps/attn_summary.json")
         lm.free()
     """
 
@@ -116,7 +113,6 @@ class SteeredCausalLM:
         self.top_p: float        = DEFAULT_TOP_P
         self.top_k: int          = DEFAULT_TOP_K
         self.top_attended_k: int = DEFAULT_TOP_ATTN_K
-        self.attn_dump_dir: str  = DEFAULT_ATTN_DIR
         self.mem_fraction: float = DEFAULT_MEM_FRAC
         self.key_scope: str      = DEFAULT_KEY_SCOPE
         self.renormalize: bool   = DEFAULT_RENORMAL
@@ -142,7 +138,6 @@ class SteeredCausalLM:
         top_p: Optional[float] = None,
         top_k: Optional[int] = None,
         top_attended_k: Optional[int] = None,
-        attn_dump_dir: Optional[str] = None,
         mem_fraction: Optional[float] = None,
         key_scope: Optional[str] = None,           # "prompt" | "all"
         renormalize: Optional[bool] = None,
@@ -157,7 +152,6 @@ class SteeredCausalLM:
         if top_p is not None:          self.top_p = top_p
         if top_k is not None:          self.top_k = top_k
         if top_attended_k is not None: self.top_attended_k = top_attended_k
-        if attn_dump_dir is not None:  self.attn_dump_dir = attn_dump_dir
         if mem_fraction is not None:   self.mem_fraction = mem_fraction
         if key_scope is not None:      self.key_scope = key_scope.lower()
         if renormalize is not None:    self.renormalize = renormalize
@@ -309,98 +303,6 @@ class SteeredCausalLM:
     ) -> str:
         suffix = answer_prefix or ""
         return f"{instruction}\n\n```{language}\n{code_snippet}\n```{suffix}"
-
-    def write_generated_logits_artifact(
-        self,
-        *,
-        result: Dict[str, Any],
-        run_dir: Path,
-        dtype: str = "float16",
-    ) -> Dict[str, Any]:
-        """
-        Persist full per-step logits for the realized generation trajectory.
-
-        File format:
-          generated_logits_full.npz with arrays:
-            - logits [num_generated, vocab]
-            - generated_token_ids [num_generated]
-            - prompt_length [1]
-            - num_generated [1]
-            - sequence_token_ids [prompt+generated]
-        """
-        assert self.model is not None and self.tokenizer is not None, "Call .build() first."
-
-        token_ids_all = result.get("token_ids_all")
-        if not isinstance(token_ids_all, list) or not token_ids_all:
-            raise RuntimeError("token_ids_all missing; cannot export logits.")
-
-        prompt_len = int(result.get("prompt_length_tokens", 0))
-        total_len = len(token_ids_all)
-        if prompt_len <= 0 or prompt_len > total_len:
-            raise RuntimeError(
-                f"Invalid prompt length ({prompt_len}) for sequence length ({total_len})."
-            )
-        num_generated = max(0, total_len - prompt_len)
-
-        if dtype == "float16":
-            np_dtype = np.float16
-            torch_dtype = torch.float16
-            dtype_label = "float16"
-        elif dtype == "float32":
-            np_dtype = np.float32
-            torch_dtype = torch.float32
-            dtype_label = "float32"
-        else:
-            raise ValueError(f"Unsupported logits dtype: {dtype}")
-
-        if num_generated > 0:
-            seq = torch.tensor([token_ids_all], dtype=torch.long, device=self.model.device)
-            model_input_ids = seq[:, :-1]
-            attention_mask = torch.ones_like(model_input_ids, dtype=torch.long, device=model_input_ids.device)
-
-            with torch.no_grad():
-                out = self.model(
-                    input_ids=model_input_ids,
-                    attention_mask=attention_mask,
-                    use_cache=False,
-                    return_dict=True,
-                )
-            step_logits = out.logits[0, prompt_len - 1 : prompt_len - 1 + num_generated, :]
-            if step_logits.shape[0] != num_generated:
-                raise RuntimeError(
-                    f"Logits length mismatch: expected {num_generated}, got {step_logits.shape[0]}."
-                )
-            logits_np = (
-                step_logits.detach()
-                .to(dtype=torch_dtype)
-                .cpu()
-                .numpy()
-                .astype(np_dtype, copy=False)
-            )
-        else:
-            vocab_size = int(getattr(self.model.config, "vocab_size", 0))
-            logits_np = np.empty((0, vocab_size), dtype=np_dtype)
-
-        generated_token_ids = np.asarray(token_ids_all[prompt_len:], dtype=np.int32)
-        sequence_token_ids = np.asarray(token_ids_all, dtype=np.int32)
-
-        run_dir.mkdir(parents=True, exist_ok=True)
-        logits_path = run_dir / "generated_logits_full.npz"
-        np.savez_compressed(
-            logits_path,
-            logits=logits_np,
-            generated_token_ids=generated_token_ids,
-            prompt_length=np.asarray([prompt_len], dtype=np.int32),
-            num_generated=np.asarray([num_generated], dtype=np.int32),
-            sequence_token_ids=sequence_token_ids,
-        )
-
-        return {
-            "generated_logits_path": str(logits_path),
-            "generated_logits_shape": [int(logits_np.shape[0]), int(logits_np.shape[1])],
-            "generated_logits_dtype": dtype_label,
-            "logits_recorded": True,
-        }
 
     def _sample_next_token(
         self,
@@ -1114,13 +1016,6 @@ class SteeredCausalLM:
 
         backend = install_steering_hooks(self.model, runtime_getter, self.steering_config)
         print(f"[Steering] Installed backend={backend}.")
-
-    def save_dump(self, result: Dict[str, Any], json_path: str) -> str:
-        """Persist a result to JSON and return the path."""
-        os.makedirs(os.path.dirname(json_path) or ".", exist_ok=True)
-        with open(json_path, "w", encoding="utf-8") as f:
-            json.dump(result, f, ensure_ascii=False, indent=2)
-        return json_path
 
     def free(self):
         """Release model and VRAM."""

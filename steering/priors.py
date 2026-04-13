@@ -47,21 +47,17 @@ class PendingCodeGadgetPrior(PriorProvider):
         *,
         joern_cli_dir: Path | None = None,
         cache_dir: Path | None = None,
-        direction: str = "backward",
         slice_depth: int = 20,
         parallelism: int = 1,
         timeout_sec: int = 180,
-        include_control: bool = True,
         max_hops: int | None = None,
     ) -> None:
         super().__init__(context)
         del joern_cli_dir
         del cache_dir
-        del direction
         del slice_depth
         del parallelism
         del timeout_sec
-        del include_control
         del max_hops
         raise RuntimeError(
             "code_gadget steering is not implemented yet: the final multi-gadget-to-prior "
@@ -77,4 +73,3 @@ class PendingCodeGadgetPrior(PriorProvider):
 PRIOR_REGISTRY = {
     "code_gadget": PendingCodeGadgetPrior,
 }
-

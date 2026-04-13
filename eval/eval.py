@@ -3,7 +3,7 @@ from __future__ import annotations
 
 import argparse
 import json
-from collections import Counter, defaultdict
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Mapping, Sequence
 
@@ -14,30 +14,24 @@ DEFAULT_PREDICTIONS_PATH = (
     / "artifacts"
     / "primevul"
     / "Qwen_Qwen2.5-Coder-7B-Instruct"
-    / "qwen25_primevul_full_steered_revdcot_s2_l8_k4"
+    / "qwen25_primevul_full_baseline_revdcot"
     / "predictions.jsonl"
 )
 DEFAULT_DATASET_PATH = PROJECT_ROOT / "Source" / "primevul_test.jsonl"
 
 PAPER_BASELINES: Mapping[str, Dict[str, Any]] = {
     "revd_qwen25_cot_primevul": {
-        "paper": "Boosting Vulnerability Detection of LLMs via Curriculum Preference",
-        "venue": "ACL Findings 2025",
-        "table": "Table 1",
-        "dataset": "PrimeVul",
         "model": "Qwen2.5-Coder-7B-Instruct",
         "setting": "COT baseline",
         "accuracy": 49.77,
         "f1": 29.86,
-        "vp_s": -0.46,
-        "source_url": "https://aclanthology.org/2025.findings-acl.467.pdf",
     }
 }
 
 
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Evaluate the partial PrimeVul steering run and print the paper baseline plus per-trial accuracy."
+        description="Evaluate a PrimeVul run and print the paper baseline plus per-trial accuracy."
     )
     parser.add_argument(
         "--predictions-path",
@@ -85,7 +79,6 @@ def _count_jsonl_rows(path: Path) -> int:
 
 def _compute_metrics(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     total = len(records)
-    parsed = [row for row in records if row.get("pred_label") is not None]
     tp = fp = tn = fn = 0
     for row in records:
         gold = int(row["gold_label"])
@@ -110,19 +103,9 @@ def _compute_metrics(records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     precision = tp / (tp + fp) if (tp + fp) else 0.0
     recall = tp / (tp + fn) if (tp + fn) else 0.0
     f1 = 2.0 * precision * recall / (precision + recall) if (precision + recall) else 0.0
-    coverage = len(parsed) / total if total else 0.0
     return {
-        "n_total": int(total),
-        "n_parsed": int(len(parsed)),
-        "coverage": float(coverage),
         "accuracy": float(accuracy),
-        "precision": float(precision),
-        "recall": float(recall),
         "f1": float(f1),
-        "tp": int(tp),
-        "tn": int(tn),
-        "fp": int(fp),
-        "fn": int(fn),
     }
 
 
@@ -148,11 +131,6 @@ def _records_by_trial(records: Iterable[Dict[str, Any]]) -> Dict[int, List[Dict[
     for row in records:
         grouped[_trial_key(row)].append(row)
     return dict(grouped)
-
-
-def _format_distribution(records: Sequence[Dict[str, Any]]) -> str:
-    gold_counts = Counter(int(row["gold_label"]) for row in records)
-    return f"safe={gold_counts.get(0, 0)}, vulnerable={gold_counts.get(1, 0)}"
 
 
 def _print_trial_metrics(

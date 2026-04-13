@@ -70,11 +70,9 @@ class SteeringConfig:
     # Joern-backed code-gadget extraction configuration.
     joern_cli_dir: Optional[Path] = None
     joern_cache_dir: Optional[Path] = None
-    joern_direction: str = "backward"
     joern_slice_depth: int = 20
     joern_parallelism: int = 1
     joern_timeout_sec: int = 180
-    joern_include_control: bool = True
     joern_max_hops: Optional[int] = None
     # Optional offline head-stat collection.
     collect_head_stats: bool = False
