@@ -373,7 +373,8 @@ def _run_generation(
 
 
 def _is_cuda_oom(exc: BaseException) -> bool:
-    if isinstance(exc, torch.OutOfMemoryError):
+    oom_type = getattr(torch, "OutOfMemoryError", None)
+    if oom_type is not None and isinstance(exc, oom_type):
         return True
     return "out of memory" in str(exc).lower()
 

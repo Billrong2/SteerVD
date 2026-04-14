@@ -732,6 +732,7 @@ def create_runtime(
     code_text: str,
     vocab_tokens: Sequence[dict],
     prompt_text: str = "",
+    prompt_token_offsets: Optional[Sequence[tuple[int, int]]] = None,
     prompt_attention_mask: Optional[Sequence[int]] = None,
 ) -> SteeringRuntime:
     manager = SteeringManager(
@@ -740,6 +741,7 @@ def create_runtime(
         code_text=code_text,
         vocab_tokens=vocab_tokens,
         prompt_text=prompt_text,
+        prompt_token_offsets=prompt_token_offsets,
     )
     pointer_mapping = build_pointer_mapping(prompt_token_ids)
     return SteeringRuntime(

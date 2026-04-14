@@ -74,6 +74,8 @@ class SteeringConfig:
     joern_parallelism: int = 1
     joern_timeout_sec: int = 180
     joern_max_hops: Optional[int] = None
+    # Code-gadget artifact-backed prompt prior.
+    code_gadget_artifact_path: Optional[Path] = None
     # Optional offline head-stat collection.
     collect_head_stats: bool = False
     collect_head_stats_first_decode_only: bool = True

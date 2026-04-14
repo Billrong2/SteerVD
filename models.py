@@ -480,6 +480,22 @@ class SteeredCausalLM:
         prompt_len = input_ids.shape[-1]
         if "attention_mask" not in enc:
             enc["attention_mask"] = torch.ones_like(input_ids, dtype=torch.long)
+        prompt_token_offsets: Optional[List[Tuple[int, int]]] = None
+        if getattr(self.tokenizer, "is_fast", False):
+            try:
+                offset_pack = self.tokenizer(prompt, return_offsets_mapping=True)
+                raw_offsets = offset_pack.get("offset_mapping")
+                if raw_offsets is not None:
+                    if raw_offsets and isinstance(raw_offsets[0], (list, tuple)) and len(raw_offsets[0]) == 2:
+                        candidate = [tuple(int(v) for v in pair) for pair in raw_offsets]
+                    elif raw_offsets and isinstance(raw_offsets[0], list):
+                        candidate = [tuple(int(v) for v in pair) for pair in raw_offsets[0]]
+                    else:
+                        candidate = None
+                    if candidate is not None and len(candidate) == prompt_len:
+                        prompt_token_offsets = candidate
+            except Exception:
+                prompt_token_offsets = None
 
         overrides = overrides or {}
         temperature = overrides.get("temperature", self.temperature)
@@ -507,6 +523,7 @@ class SteeredCausalLM:
                 code_text=code_text,
                 vocab_tokens=self._current_vocab_tokens,
                 prompt_text=prompt,
+                prompt_token_offsets=prompt_token_offsets,
                 prompt_attention_mask=enc["attention_mask"][0].tolist(),
             )
             runtime.start(max_new_tokens)
@@ -788,6 +805,7 @@ class SteeredCausalLM:
         vocab_tokens: Optional[Sequence[dict]] = None,
         snippet_name: Optional[str] = None,
         steering_code_snippet: Optional[str] = None,
+        prompt_text_override: Optional[str] = None,
     ) -> Dict[str, Any]:
         """
         Auto head subset calibration:
@@ -827,20 +845,44 @@ class SteeredCausalLM:
         agg_count: Optional[np.ndarray] = None
         valid_runs = 0
 
-        prev_cfg = self.steering_config
-        self.steering_config = calib_cfg
-        try:
-            for run_idx in range(1, runs + 1):
-                result = self.run_llama(
+        def _run_calibration_pass(*, do_sample: bool, max_new_tokens: int) -> Dict[str, Any]:
+            if prompt_text_override is None:
+                return self.run_llama(
                     code_snippet,
                     instruction=instruction,
                     language=language,
-                    max_new_tokens=calib_max_new,
-                    do_sample=True,
+                    max_new_tokens=max_new_tokens,
+                    do_sample=do_sample,
                     record_layers=False,
                     record_attention=False,
                     vocab_tokens=vocab_tokens,
                     steering_code_snippet=steering_code_snippet,
+                )
+
+            overrides: Dict[str, Any] = {
+                "max_new_tokens": max(1, int(max_new_tokens)),
+                "do_sample": bool(do_sample),
+                "record_layers": False,
+                "record_attention": False,
+            }
+            self._current_code_snippet = (
+                steering_code_snippet if steering_code_snippet is not None else code_snippet
+            )
+            self._current_vocab_tokens = vocab_tokens or []
+            try:
+                return self._generate_with_attn(prompt_text_override, overrides=overrides)
+            finally:
+                self._current_code_snippet = ""
+                self._current_vocab_tokens = []
+
+        prev_cfg = self.steering_config
+        self.steering_config = calib_cfg
+        try:
+            for run_idx in range(1, runs + 1):
+                del run_idx
+                result = _run_calibration_pass(
+                    do_sample=True,
+                    max_new_tokens=calib_max_new,
                 )
                 hs = (result.get("steering_debug") or {}).get("head_stats")
                 if not hs:
@@ -968,26 +1010,14 @@ class SteeredCausalLM:
             cfg_auto.collect_head_stats = False
 
             self.steering_config = cfg_none
-            out_none = self.run_llama(
-                code_snippet,
-                instruction=instruction,
-                language=language,
-                max_new_tokens=min(calib_max_new, 16),
+            out_none = _run_calibration_pass(
                 do_sample=False,
-                record_layers=False,
-                record_attention=False,
-                vocab_tokens=vocab_tokens,
+                max_new_tokens=min(calib_max_new, 16),
             )
             self.steering_config = cfg_auto
-            out_auto = self.run_llama(
-                code_snippet,
-                instruction=instruction,
-                language=language,
-                max_new_tokens=min(calib_max_new, 16),
+            out_auto = _run_calibration_pass(
                 do_sample=False,
-                record_layers=False,
-                record_attention=False,
-                vocab_tokens=vocab_tokens,
+                max_new_tokens=min(calib_max_new, 16),
             )
             noop_ok = out_none.get("token_ids_all") == out_auto.get("token_ids_all")
             self.steering_config = base_cfg

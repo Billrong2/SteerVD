@@ -24,25 +24,20 @@ class SteeringManager:
         code_text: str,
         vocab_tokens: Sequence[dict],
         prompt_text: str = "",
+        prompt_token_offsets: Optional[Sequence[tuple[int, int]]] = None,
     ):
         self.config = config
         self.config.load_schedule()
         prior_cls = PRIOR_REGISTRY[config.prior]
         prior_kwargs = {}
         if config.prior == "code_gadget":
-            prior_kwargs.update(
-                joern_cli_dir=config.joern_cli_dir,
-                cache_dir=config.joern_cache_dir,
-                slice_depth=config.joern_slice_depth,
-                parallelism=config.joern_parallelism,
-                timeout_sec=config.joern_timeout_sec,
-                max_hops=config.joern_max_hops,
-            )
+            prior_kwargs["artifact_path"] = config.code_gadget_artifact_path
         context = PriorContext(
             prompt_tokens=prompt_tokens,
             code_text=code_text,
             vocab_tokens=vocab_tokens,
             prompt_text=prompt_text,
+            prompt_token_offsets=prompt_token_offsets,
         )
         self.prior_provider = prior_cls(context, **prior_kwargs)
         self.state: Optional[SteeringState] = None
