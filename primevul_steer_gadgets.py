@@ -53,6 +53,11 @@ class GadgetTarget:
     gadget_relpath: str
     gadget_index: int
     api_call_name: str
+    unit_type: str
+    arg_index: Optional[int]
+    arg_text: Optional[str]
+    coverage: Optional[float]
+    coverage_weight: Optional[float]
     needed_runs: Tuple[int, ...]
 
 
@@ -83,12 +88,28 @@ def _numeric_name_key(path: Path) -> Tuple[int, str]:
     return (0, f"{parsed:020d}")
 
 
-def _gadget_key(path: Path) -> Tuple[int, str]:
+def _unit_key(path: Path) -> Tuple[int, str, str]:
     prefix = path.name.split("__", 1)[0]
-    parsed = _safe_int(prefix.replace("gadget_", "", 1))
+    index_text = prefix
+    for marker in ("gadget_", "slice_"):
+        if index_text.startswith(marker):
+            index_text = index_text.replace(marker, "", 1)
+            break
+    parsed = _safe_int(index_text)
     if parsed is None:
-        return (1, path.name)
-    return (0, f"{parsed:06d}")
+        return (1, path.name, path.name)
+    return (0, f"{parsed:06d}", path.name)
+
+
+def _iter_unit_dirs(snippet_dir: Path) -> Iterator[Path]:
+    for path in snippet_dir.iterdir():
+        if not path.is_dir():
+            continue
+        if not (path / "gadget.json").is_file():
+            continue
+        if not (path / "code_gadget.c").is_file():
+            continue
+        yield path
 
 
 def _iter_existing_predictions(predictions_path: Path) -> Iterator[Dict[str, Any]]:
@@ -174,10 +195,7 @@ def _discover_targets(
             continue
 
         snippet_idx = str(status.get("dataset_idx") or snippet_dir.name)
-        for gadget_dir in sorted(
-            (path for path in snippet_dir.iterdir() if path.is_dir() and path.name.startswith("gadget_")),
-            key=_gadget_key,
-        ):
+        for gadget_dir in sorted(_iter_unit_dirs(snippet_dir), key=_unit_key):
             label_path = gadget_dir / LABEL_FILENAME
             gadget_json_path = gadget_dir / "gadget.json"
             if not gadget_json_path.is_file():
@@ -216,6 +234,11 @@ def _discover_targets(
                     gadget_relpath=relpath,
                     gadget_index=int(gadget_payload.get("gadget_index", 0)),
                     api_call_name=str(gadget_payload.get("api_call_name") or "unknown_call"),
+                    unit_type=str(gadget_payload.get("unit_type") or "gadget"),
+                    arg_index=_safe_int(gadget_payload.get("arg_index")),
+                    arg_text=gadget_payload.get("arg_text"),
+                    coverage=float(gadget_payload.get("coverage")) if gadget_payload.get("coverage") is not None else None,
+                    coverage_weight=float(gadget_payload.get("coverage_weight")) if gadget_payload.get("coverage_weight") is not None else None,
                     needed_runs=tuple(int(sample_run) for sample_run in needed_runs),
                 )
             )
@@ -377,6 +400,7 @@ def main() -> int:
         "n_bins": int(args.n_bins),
         "beta_bias": float(args.beta_bias),
         "beta_post": float(args.beta_post),
+        "beta_post_dynamic_from_coverage": bool(args.variant == "steered"),
         "steer_last_n_layers": int(args.steer_last_n_layers),
         "head_subset_mode": str(args.head_subset_mode),
         "head_subset_topk_per_layer": int(args.head_subset_topk_per_layer),
@@ -507,7 +531,12 @@ def main() -> int:
                 label_path = target.gadget_dir / LABEL_FILENAME
                 gadget_label = dict(_load_json(label_path)) if label_path.is_file() else {}
 
+                target_beta_post = float(args.beta_post)
+                if args.variant == "steered" and target.coverage_weight is not None:
+                    target_beta_post = float(args.beta_post) * float(target.coverage_weight)
+
                 if steering_config is not None:
+                    steering_config.beta_post = float(target_beta_post)
                     steering_config.code_gadget_artifact_path = target.gadget_dir
                     steering_config.head_mask_inline = None
                     steering_config.head_subset_selected_heads = {}
@@ -572,8 +601,15 @@ def main() -> int:
                             "variant": str(args.variant),
                             "gadget_relpath": str(target.gadget_relpath),
                             "gadget_index": int(gadget_payload.get("gadget_index", target.gadget_index)),
+                            "unit_type": str(gadget_payload.get("unit_type") or target.unit_type),
                             "api_call_name": str(gadget_payload.get("api_call_name") or target.api_call_name),
                             "call_line": _safe_int(gadget_payload.get("call_line")),
+                            "arg_index": _safe_int(gadget_payload.get("arg_index", target.arg_index)),
+                            "arg_text": gadget_payload.get("arg_text", target.arg_text),
+                            "coverage": gadget_payload.get("coverage", target.coverage),
+                            "coverage_weight": gadget_payload.get("coverage_weight", target.coverage_weight),
+                            "effective_beta_post": float(target_beta_post) if args.variant == "steered" else 0.0,
+                            "parent_gadget_relpath": gadget_payload.get("parent_gadget_relpath"),
                             "gadget_label_pred": str(gadget_label.get("pred_label") or ""),
                             "patch_support_label": gadget_label.get("patch_support_label"),
                             "gold_label": 1 if int(row.get("target", 0)) != 0 else 0,
@@ -596,8 +632,15 @@ def main() -> int:
                             "variant": str(args.variant),
                             "gadget_relpath": str(target.gadget_relpath),
                             "gadget_index": int(gadget_payload.get("gadget_index", target.gadget_index)),
+                            "unit_type": str(gadget_payload.get("unit_type") or target.unit_type),
                             "api_call_name": str(gadget_payload.get("api_call_name") or target.api_call_name),
                             "call_line": _safe_int(gadget_payload.get("call_line")),
+                            "arg_index": _safe_int(gadget_payload.get("arg_index", target.arg_index)),
+                            "arg_text": gadget_payload.get("arg_text", target.arg_text),
+                            "coverage": gadget_payload.get("coverage", target.coverage),
+                            "coverage_weight": gadget_payload.get("coverage_weight", target.coverage_weight),
+                            "effective_beta_post": float(target_beta_post) if args.variant == "steered" else 0.0,
+                            "parent_gadget_relpath": gadget_payload.get("parent_gadget_relpath"),
                             "gadget_label_pred": str(gadget_label.get("pred_label") or ""),
                             "patch_support_label": gadget_label.get("patch_support_label"),
                             "gold_label": 1 if int(row.get("target", 0)) != 0 else 0,

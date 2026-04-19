@@ -88,13 +88,28 @@ def _numeric_name_key(path: Path) -> Tuple[int, str]:
     return (0, f"{parsed:020d}")
 
 
-def _gadget_key(path: Path) -> Tuple[int, str]:
+def _unit_key(path: Path) -> Tuple[int, str, str]:
     prefix = path.name.split("__", 1)[0]
-    index_text = prefix.replace("gadget_", "", 1)
+    index_text = prefix
+    for marker in ("gadget_", "slice_"):
+        if index_text.startswith(marker):
+            index_text = index_text.replace(marker, "", 1)
+            break
     parsed = _safe_int(index_text)
     if parsed is None:
-        return (1, path.name)
-    return (0, f"{parsed:06d}")
+        return (1, path.name, path.name)
+    return (0, f"{parsed:06d}", path.name)
+
+
+def _iter_unit_dirs(snippet_dir: Path) -> Iterator[Path]:
+    for path in snippet_dir.iterdir():
+        if not path.is_dir():
+            continue
+        if not (path / "gadget.json").is_file():
+            continue
+        if not (path / "code_gadget.c").is_file():
+            continue
+        yield path
 
 
 def _normalize_target(value: Any) -> Optional[int]:
@@ -366,10 +381,7 @@ def _discover_targets(input_root: Path, *, resume: bool) -> Tuple[List[GadgetTar
         if not isinstance(status, dict) or status.get("status") != "ok":
             continue
 
-        for gadget_dir in sorted(
-            (path for path in snippet_dir.iterdir() if path.is_dir() and path.name.startswith("gadget_")),
-            key=_gadget_key,
-        ):
+        for gadget_dir in sorted(_iter_unit_dirs(snippet_dir), key=_unit_key):
             gadget_json_path = gadget_dir / "gadget.json"
             code_gadget_path = gadget_dir / "code_gadget.c"
             if not gadget_json_path.is_file() or not code_gadget_path.is_file():
@@ -397,10 +409,7 @@ def _discover_targets(input_root: Path, *, resume: bool) -> Tuple[List[GadgetTar
 
 def _iter_existing_label_records(input_root: Path) -> Iterator[Dict[str, Any]]:
     for snippet_dir in sorted((path for path in input_root.iterdir() if path.is_dir()), key=_numeric_name_key):
-        for gadget_dir in sorted(
-            (path for path in snippet_dir.iterdir() if path.is_dir() and path.name.startswith("gadget_")),
-            key=_gadget_key,
-        ):
+        for gadget_dir in sorted(_iter_unit_dirs(snippet_dir), key=_unit_key):
             label_path = gadget_dir / LABEL_FILENAME
             if not label_path.is_file():
                 continue
@@ -426,7 +435,7 @@ def _write_state(path: Path, payload: Dict[str, Any]) -> None:
 
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Label exported PrimeVul code gadgets with a baseline model.")
+    parser = argparse.ArgumentParser(description="Label exported PrimeVul code gadgets or derived slice units.")
     parser.add_argument("--input-root", type=Path, default=DEFAULT_INPUT_ROOT)
     parser.add_argument("--paired-dataset-path", type=Path, default=DEFAULT_PAIRED_DATASET_PATH)
     parser.add_argument("--label-mode", choices=["heuristic_only", "model"], default="heuristic_only")
@@ -627,8 +636,14 @@ def main() -> int:
                     "row_index": _safe_int(status.get("row_index")),
                     "gold_snippet_label": _normalize_target(row.get("target")),
                     "gadget_index": int(gadget_json.get("gadget_index", target.gadget_index)),
+                    "unit_type": str(gadget_json.get("unit_type") or "gadget"),
                     "api_call_name": str(gadget_json.get("api_call_name") or target.api_call_name),
                     "call_line": _safe_int(gadget_json.get("call_line")),
+                    "arg_index": _safe_int(gadget_json.get("arg_index")),
+                    "arg_text": gadget_json.get("arg_text"),
+                    "coverage": gadget_json.get("coverage"),
+                    "coverage_weight": gadget_json.get("coverage_weight"),
+                    "parent_gadget_relpath": gadget_json.get("parent_gadget_relpath"),
                     **overlap,
                     **statement_support,
                 }
